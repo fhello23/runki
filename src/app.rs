@@ -135,8 +135,9 @@ impl RunkiApp {
         }
         if !self.later_save_blocked {
             if let Some(deck) = &self.deck {
-                if let Err(err) = deck::save_later(&deck.path, &self.later) {
-                    self.error = Some(format!("{err:#}"));
+                match deck::save_later(&deck.path, &self.later) {
+                    Ok(()) => self.error = None,
+                    Err(err) => self.error = Some(format!("{err:#}")),
                 }
             }
         }
@@ -152,6 +153,18 @@ impl RunkiApp {
         if self.current().map(|(c, _, _)| c.id) != Some(card.id) {
             self.revealed = false;
         }
+    }
+
+    /// Number of cards in the open deck that are flagged for later.
+    /// Stale ids matching no card are ignored (but kept in `later`).
+    fn later_count(&self) -> usize {
+        let Some(deck) = &self.deck else {
+            return 0;
+        };
+        deck.cards
+            .iter()
+            .filter(|card| self.later.contains(&card.id))
+            .count()
     }
 
     fn set_mode(&mut self, mode: Mode) {
@@ -206,7 +219,7 @@ impl RunkiApp {
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let later_label = format!("Study later ({})", self.later.len());
+                    let later_label = format!("Study later ({})", self.later_count());
                     if ui
                         .selectable_label(self.mode == Mode::Later, later_label)
                         .clicked()
@@ -267,7 +280,12 @@ impl RunkiApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(error) = self.error.clone() {
                 ui.add_space(16.0);
-                ui.colored_label(egui::Color32::LIGHT_RED, error);
+                ui.horizontal(|ui| {
+                    ui.colored_label(egui::Color32::LIGHT_RED, error);
+                    if ui.small_button("×").clicked() {
+                        self.error = None;
+                    }
+                });
                 ui.add_space(16.0);
             }
 
@@ -400,6 +418,46 @@ mod tests {
         assert!(!app.revealed);
         assert!(app.current().is_none());
         assert!(app.view().is_empty());
+    }
+
+    fn cleanup(app: &RunkiApp) {
+        if let Some(dir) = app.deck.as_ref().and_then(|d| d.path.parent()) {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn later_count_ignores_stale_ids() {
+        let app = test_app(
+            "later-count-stale",
+            &["a", "stale-1", "stale-2"],
+            Mode::All,
+            0,
+            false,
+        );
+
+        assert_eq!(app.later_count(), 1);
+        // Stale ids are not deleted from the in-memory set (or file).
+        assert_eq!(app.later.len(), 3);
+        assert!(app.later.contains("stale-1"));
+        cleanup(&app);
+    }
+
+    #[test]
+    fn error_cleared_after_successful_save() {
+        let mut app = test_app("error-cleared-on-save", &[], Mode::All, 0, false);
+        // Make the first save fail by occupying the sidecar path with a dir.
+        let deck_path = app.deck.as_ref().expect("deck").path.clone();
+        let sidecar = deck::later_path(&deck_path);
+        std::fs::create_dir_all(&sidecar).expect("create blocking dir");
+
+        app.toggle_later();
+        assert!(app.error.is_some(), "failed save should set error");
+
+        std::fs::remove_dir_all(&sidecar).expect("remove blocking dir");
+        app.toggle_later();
+        assert_eq!(app.error, None, "successful save should clear error");
+        cleanup(&app);
     }
 
     #[test]
