@@ -1,3 +1,5 @@
+<img src="assets/icon.png" alt="Runki icon" width="128" align="right">
+
 # Runki
 
 [![CI](https://github.com/fhello23/runki/actions/workflows/ci.yml/badge.svg)](https://github.com/fhello23/runki/actions/workflows/ci.yml)
