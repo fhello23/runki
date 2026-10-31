@@ -1,44 +1,85 @@
-//! egui front-end: one card at a time.
+//! egui front-end: a library screen, then one card at a time.
 //!
+//! - The start screen is the library: the decks in one folder
+//!   (see [`crate::library`]). Clicking a deck opens the study
+//!   screen; **Library** in its top bar goes back.
 //! - `Space` (or a click on the card) shows the answer, then moves to
 //!   the next card (wrapping around at the end, so browsing never stops).
 //! - `L` toggles the current card in the study-later list.
-//! - The top bar switches between all cards and study-later only.
+//! - The study top bar picks the card order (deck order or shuffled)
+//!   and which cards to show (all, unseen only, or study-later only).
+//!
+//! Study logic (order, filter, position, saving) lives in
+//! [`crate::session::StudySession`]; this module keeps the config,
+//! save debounce, error banners, file pickers, and drag-and-drop.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 
-use crate::deck::{self, Deck};
-use crate::progress::{self, DeckState, LoadOutcome};
+use crate::deck::{self, Card};
+use crate::library::{self, DeckEntry, DeckStatus, LibraryLoader};
+use crate::progress::{self, CardFilter, CardOrder, LoadOutcome};
+use crate::session::StudySession;
 use crate::theme::{self, Palette};
+use crate::VERSION;
 
 /// How often a dirty state is written while studying.
 const SAVE_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Storage key for [`Config`] in eframe's persistent storage.
+pub const CONFIG_KEY: &str = "runki_config";
+
+/// Per-machine app config (not synced): which folder is the library
+/// and which deck was opened last. Stored via eframe persistence
+/// (loaded from `cc.storage` in `main`, saved in [`eframe::App::save`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Config {
+    /// The library folder, if one has been chosen.
+    #[serde(default)]
+    pub library: Option<PathBuf>,
+    /// The deck most recently opened, from anywhere.
+    #[serde(default)]
+    pub last_open_deck: Option<PathBuf>,
+}
+
+/// Reveal a not-downloaded deck in Finder (`open -R`), pointing at
+/// the real file if it exists and at its iCloud placeholder
+/// otherwise, so the user can download it there. Best-effort: a
+/// failed spawn is ignored. macOS only; other OSes hide the button.
+#[cfg(target_os = "macos")]
+fn show_in_finder(real_path: &std::path::Path) {
+    let _ = std::process::Command::new("open")
+        .arg("-R")
+        .arg(library::reveal_path(real_path))
+        .spawn();
+}
+
+/// Which screen is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    All,
-    Later,
+pub enum Screen {
+    Library,
+    Study,
 }
 
 pub struct RunkiApp {
-    deck: Option<Deck>,
-    /// Light, dark or follow the system; saved in the app config.
+    config: Config,
     theme: egui::ThemePreference,
-    /// Index into the current view (all cards, or flagged only).
-    pos: usize,
-    revealed: bool,
-    mode: Mode,
-    state: DeckState,
-    state_path: Option<PathBuf>,
-    /// Set when the progress file could not be read: changes still
-    /// update `state` in memory but must not overwrite the file.
-    save_blocked: bool,
-    /// `state` has unsaved changes.
-    dirty: bool,
+    screen: Screen,
+    /// Rows from the latest library scan, with loader summaries
+    /// applied as they arrive.
+    library_entries: Vec<DeckEntry>,
+    /// Why the latest scan failed (missing/unreadable folder).
+    library_error: Option<String>,
+    /// Created on the first frame, when an egui context is at hand
+    /// for its repaint callback.
+    loader: Option<LibraryLoader>,
+    session: Option<StudySession>,
     last_save_attempt: Option<Instant>,
+    /// The reset-progress confirmation dialog is open.
+    show_reset_confirm: bool,
     error: Option<String>,
     /// Error from the last save attempt; cleared by the next
     /// successful save. Kept apart from `error` so a background save
@@ -47,21 +88,27 @@ pub struct RunkiApp {
 }
 
 impl RunkiApp {
-    pub fn new(initial_deck: Option<PathBuf>) -> Self {
+    /// Start on the library screen, unless `initial_deck` (a CLI
+    /// argument) opens straight into the study screen. The last
+    /// open deck is *not* auto-reopened: the library is the start
+    /// screen; `last_open_deck` is only remembered in the config.
+    /// A CLI argument is the only thing that wins over it, by
+    /// construction.
+    pub fn new(config: Config, initial_deck: Option<PathBuf>) -> Self {
         let mut app = Self {
-            deck: None,
+            config,
             theme: egui::ThemePreference::System,
-            pos: 0,
-            revealed: false,
-            mode: Mode::All,
-            state: DeckState::new(),
-            state_path: None,
-            save_blocked: false,
-            dirty: false,
+            screen: Screen::Library,
+            library_entries: Vec::new(),
+            library_error: None,
+            loader: None,
+            session: None,
             last_save_attempt: None,
+            show_reset_confirm: false,
             error: None,
             save_error: None,
         };
+        app.rescan_library();
         if let Some(path) = initial_deck {
             app.open_path(path);
         }
@@ -74,19 +121,32 @@ impl RunkiApp {
         self
     }
 
+    /// The current config (what `App::save` persists).
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// The screen currently showing.
+    pub fn screen(&self) -> Screen {
+        self.screen
+    }
+
     fn open_path(&mut self, path: PathBuf) {
         match deck::load_deck(&path) {
             Ok(deck) => {
                 // Always save the outgoing deck's progress first, and
                 // say so if that failed: its unsaved changes are lost.
+                let outgoing_name = self.session.as_ref().map(|s| s.deck().name.clone());
                 self.save_now();
                 let outgoing_error = self.save_error.take().map(|err| {
-                    let name = self.deck.as_ref().map_or("the previous deck", |d| &d.name);
+                    let name = outgoing_name.as_deref().unwrap_or("the previous deck");
                     format!("Progress for {name} could not be saved: {err}")
                 });
-                let state_path = progress::state_path(&deck.path, None);
+                // A deck in the library uses the library state file
+                // however it was opened; others use a sidecar.
+                let state_path = progress::state_path(&deck.path, self.config.library.as_deref());
                 let outcome = progress::load(&deck.path, &state_path);
-                self.save_blocked = outcome.is_blocked();
+                let save_blocked = outcome.is_blocked();
                 let load_error = match &outcome {
                     LoadOutcome::Blocked { error, .. } => Some(format!(
                         "{error:#}. Progress could not be read, so \
@@ -99,17 +159,17 @@ impl RunkiApp {
                     (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
                     (a, b) => a.or(b),
                 };
-                // A migrated state only exists in memory until saved.
-                self.dirty = outcome.is_migrated();
-                self.state = outcome.into_state();
-                self.state_path = Some(state_path);
-                // Opening is itself a state change.
-                self.state.mark_opened(progress::now_ms());
-                self.dirty = true;
-                self.deck = Some(deck);
-                self.pos = 0;
-                self.revealed = false;
-                self.mode = Mode::All;
+                let state = outcome.into_state();
+                self.config.last_open_deck = Some(deck.path.clone());
+                self.session = Some(StudySession::new(
+                    deck,
+                    state,
+                    state_path,
+                    save_blocked,
+                    progress::now_ms(),
+                ));
+                self.show_reset_confirm = false;
+                self.screen = Screen::Study;
             }
             Err(err) => {
                 self.error = Some(format!("{err:#}"));
@@ -124,20 +184,15 @@ impl RunkiApp {
     }
 
     fn save_now_at(&mut self, now: Instant) {
-        if !self.dirty || self.save_blocked {
-            return;
-        }
-        let Some(state_path) = &self.state_path else {
+        let Some(session) = &mut self.session else {
             return;
         };
-        if self.deck.is_none() {
+        if !session.dirty() || session.save_blocked() {
             return;
         }
         self.last_save_attempt = Some(now);
-        match progress::save(state_path, &self.state) {
-            Ok(merged) => {
-                self.state = merged;
-                self.dirty = false;
+        match session.save() {
+            Ok(()) => {
                 self.save_error = None;
             }
             Err(err) => {
@@ -150,7 +205,8 @@ impl RunkiApp {
     /// the last save attempt. Returns how long until the next attempt
     /// is due, so the caller can schedule a repaint for it.
     fn maybe_save_debounced_at(&mut self, now: Instant) -> Option<Duration> {
-        if !self.dirty || self.save_blocked {
+        let session = self.session.as_ref()?;
+        if !session.dirty() || session.save_blocked() {
             return None;
         }
         let due = self
@@ -161,11 +217,14 @@ impl RunkiApp {
         }
         // Still dirty (not due yet, or the save failed): next attempt
         // is due one interval after the last one.
-        self.dirty.then(|| {
-            self.last_save_attempt
-                .map(|last| (last + SAVE_INTERVAL).saturating_duration_since(now))
-                .unwrap_or(Duration::ZERO)
-        })
+        self.session
+            .as_ref()
+            .is_some_and(StudySession::dirty)
+            .then(|| {
+                self.last_save_attempt
+                    .map(|last| (last + SAVE_INTERVAL).saturating_duration_since(now))
+                    .unwrap_or(Duration::ZERO)
+            })
     }
 
     fn pick_and_open(&mut self) {
@@ -177,113 +236,164 @@ impl RunkiApp {
         }
     }
 
-    /// Indices of the flagged cards, visible in `Mode::Later`.
-    fn later_view(&self) -> Vec<usize> {
-        let Some(deck) = &self.deck else {
-            return Vec::new();
+    /// Re-scan the library folder; rows appear at once and the
+    /// background loader fills in their counts.
+    fn rescan_library(&mut self) {
+        let Some(dir) = self.config.library.clone() else {
+            self.library_entries.clear();
+            self.library_error = None;
+            return;
         };
-        deck.cards
-            .iter()
-            .enumerate()
-            .filter(|(_, card)| self.state.is_later(&card.id))
-            .map(|(i, _)| i)
-            .collect()
-    }
-
-    /// Number of cards visible in the current mode.
-    fn view_len(&self) -> usize {
-        let Some(deck) = &self.deck else {
-            return 0;
-        };
-        match self.mode {
-            Mode::All => deck.cards.len(),
-            Mode::Later => self.later_count(),
+        match library::scan(&dir) {
+            Ok(entries) => {
+                self.library_entries = entries;
+                self.library_error = None;
+                self.start_loader();
+            }
+            Err(err) => {
+                self.library_entries.clear();
+                self.library_error = Some(format!("{err:#}"));
+            }
         }
     }
 
-    /// Index into `deck.cards` of the card at `self.pos` in the view.
-    fn current_index(&self) -> Option<usize> {
-        let deck = self.deck.as_ref()?;
-        match self.mode {
-            Mode::All => (self.pos < deck.cards.len()).then_some(self.pos),
-            Mode::Later => self.later_view().get(self.pos).copied(),
+    /// (Re)start the background loader for the current rows, once
+    /// it exists (it is created on the first frame).
+    fn start_loader(&self) {
+        if let (Some(loader), Some(dir)) = (&self.loader, &self.config.library) {
+            // Not-downloaded rows are never sent to the loader:
+            // reading one would block on a cloud download.
+            loader.start(dir, library::loadable_paths(&self.library_entries));
         }
     }
 
-    fn current(&self) -> Option<(&deck::Card, usize, usize)> {
-        let deck = self.deck.as_ref()?;
-        let idx = self.current_index()?;
-        Some((&deck.cards[idx], self.pos + 1, self.view_len()))
+    /// Create the loader on the first frame, wiring its repaint
+    /// callback to this window, and start it for the scanned rows.
+    fn ensure_loader(&mut self, ctx: &egui::Context) {
+        if self.loader.is_none() {
+            let ctx = ctx.clone();
+            self.loader = Some(LibraryLoader::new(Box::new(move || {
+                ctx.request_repaint();
+            })));
+            self.start_loader();
+        }
     }
 
-    /// Space: reveal the answer, or advance (wrapping) if already shown.
-    /// Revealing marks the card seen.
-    fn space(&mut self) {
-        let view_len = self.view_len();
-        if view_len == 0 {
+    /// Fold arrived background summaries into the rows.
+    fn apply_summaries(&mut self) {
+        let Some(loader) = &self.loader else { return };
+        let summaries = loader.drain();
+        if summaries.is_empty() {
             return;
         }
-        if self.revealed {
-            self.pos = (self.pos + 1) % view_len;
-            self.revealed = false;
-        } else {
-            if let Some(card_id) = self.current().map(|(card, _, _)| card.id.clone()) {
-                self.state.mark_seen(&card_id, progress::now_ms());
-                self.dirty = true;
+        for summary in summaries {
+            if let Some(entry) = self
+                .library_entries
+                .iter_mut()
+                .find(|entry| entry.path == summary.path)
+            {
+                entry.status = summary.status;
+                entry.opened_at = summary.opened_at;
             }
-            self.revealed = true;
+        }
+        library::sort_entries(&mut self.library_entries);
+    }
+
+    /// Point the library at `dir` and show it.
+    fn set_library(&mut self, dir: PathBuf) {
+        self.config.library = Some(dir);
+        self.screen = Screen::Library;
+        self.rescan_library();
+    }
+
+    fn choose_library_folder(&mut self) {
+        // New Folder lets the user make e.g. a `Runki` folder inside
+        // iCloud Drive right from the picker.
+        if let Some(dir) = rfd::FileDialog::new()
+            .set_can_create_directories(true)
+            .pick_folder()
+        {
+            self.set_library(dir);
+        }
+    }
+
+    /// "Add deck…": copy picked files into the library.
+    fn add_decks_via_picker(&mut self) {
+        if let Some(paths) = rfd::FileDialog::new()
+            .add_filter("Decks", &["apkg", "csv", "tsv", "txt"])
+            .pick_files()
+        {
+            self.add_to_library(paths);
+        }
+    }
+
+    /// Copy each file into the library (carrying progress over),
+    /// report any failures, then rescan.
+    fn add_to_library(&mut self, paths: Vec<PathBuf>) {
+        let Some(dir) = self.config.library.clone() else {
+            return;
+        };
+        let errors: Vec<String> = paths
+            .iter()
+            .filter_map(|path| {
+                library::add_deck(&dir, path)
+                    .err()
+                    .map(|err| format!("{err:#}"))
+            })
+            .collect();
+        if !errors.is_empty() {
+            self.error = Some(errors.join("\n"));
+        }
+        self.rescan_library();
+    }
+
+    /// Back to the library: save first (reporting failure like a
+    /// deck switch does, since the session is dropped), then rescan
+    /// so the rows show the progress just made.
+    fn go_to_library(&mut self) {
+        let outgoing_name = self.session.as_ref().map(|s| s.deck().name.clone());
+        self.save_now();
+        if let Some(err) = self.save_error.take() {
+            let name = outgoing_name.as_deref().unwrap_or("the previous deck");
+            self.error = Some(format!("Progress for {name} could not be saved: {err}"));
+        }
+        self.session = None;
+        self.show_reset_confirm = false;
+        self.screen = Screen::Library;
+        self.rescan_library();
+    }
+
+    /// The card on screen with its `(n, view_len)` position.
+    fn current(&self) -> Option<(&Card, usize, usize)> {
+        let session = self.session.as_ref()?;
+        let card = session.current_card()?;
+        let (n, total) = session.view_position()?;
+        Some((card, n, total))
+    }
+
+    /// Space: reveal the answer, or advance if already shown.
+    fn space(&mut self) {
+        if let Some(session) = &mut self.session {
+            session.space(progress::now_ms());
         }
     }
 
     /// L: toggle the current card in the study-later list.
-    /// The change is saved by the debounced saver.
     fn toggle_later(&mut self) {
-        let Some(card_id) = self.current().map(|(card, _, _)| card.id.clone()) else {
-            return;
-        };
-        let on = !self.state.is_later(&card_id);
-        self.state.set_later(&card_id, on, progress::now_ms());
-        self.dirty = true;
-        // Unflagging while reviewing the later list shrinks the view;
-        // keep the position pointing at the next remaining card.
-        let view_len = self.view_len();
-        if view_len == 0 {
-            self.pos = 0;
-        } else if self.pos >= view_len {
-            self.pos = view_len - 1;
-        }
-        // If a different card is now shown, hide its answer.
-        if self.current().map(|(c, _, _)| &c.id) != Some(&card_id) {
-            self.revealed = false;
-        }
-    }
-
-    /// Number of cards in the open deck that are flagged for later.
-    /// Stale ids matching no card are ignored (but kept in the state).
-    fn later_count(&self) -> usize {
-        let Some(deck) = &self.deck else {
-            return 0;
-        };
-        self.state
-            .later_count(deck.cards.iter().map(|card| card.id.as_str()))
-    }
-
-    fn set_mode(&mut self, mode: Mode) {
-        if self.mode != mode {
-            self.mode = mode;
-            self.pos = 0;
-            self.revealed = false;
+        if let Some(session) = &mut self.session {
+            session.toggle_later(progress::now_ms());
         }
     }
 }
 
 impl eframe::App for RunkiApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.save_now();
+        eframe::set_value(storage, CONFIG_KEY, &self.config);
         theme::store(storage, self.theme);
     }
 
-    /// Only settings saved in [`Self::save`] are kept; egui's own
-    /// memory (which includes its styles) is rebuilt on every launch.
+    // Rebuild styles from the installed palettes on each launch.
     fn persist_egui_memory(&self) -> bool {
         false
     }
@@ -293,21 +403,47 @@ impl eframe::App for RunkiApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Drag-and-drop a deck file onto the window to open it.
-        let dropped = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
-        if let Some(path) = dropped {
-            self.open_path(path);
+        self.ensure_loader(ctx);
+        self.apply_summaries();
+
+        // Drag-and-drop: onto the library screen copies files in;
+        // onto the study screen opens the first one (as before).
+        // Without a library folder there is nothing to copy into,
+        // so opening is the fallback there too.
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        if !dropped.is_empty() {
+            if self.screen == Screen::Library && self.config.library.is_some() {
+                self.add_to_library(dropped);
+            } else if let Some(path) = dropped.into_iter().next() {
+                self.open_path(path);
+            }
         }
 
-        // Consume Space/L before widgets see them, so a focused button
-        // cannot also trigger on Space and double-advance.
-        let space = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space));
-        let later_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::L));
-        if space {
-            self.space();
-        }
-        if later_key {
-            self.toggle_later();
+        if self.screen == Screen::Study {
+            // Consume Space/L before widgets see them, so a focused
+            // button cannot also trigger on Space and double-advance.
+            // While the reset confirmation is open they are consumed
+            // but ignored.
+            let space = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space));
+            let later_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::L));
+            let escape = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+            if escape {
+                self.show_reset_confirm = false;
+            }
+            if !self.show_reset_confirm {
+                if space {
+                    self.space();
+                }
+                if later_key {
+                    self.toggle_later();
+                }
+            }
         }
 
         // Debounced save, with a repaint scheduled so a pending save
@@ -317,92 +453,157 @@ impl eframe::App for RunkiApp {
         }
 
         let p = Palette::of(ctx);
-        self.top_bar(ctx, &p);
-        // The welcome screen has nothing to study, so no bottom bar.
-        if self.deck.is_some() {
-            self.bottom_bar(ctx, &p);
+        match self.screen {
+            Screen::Library => {
+                self.library_top_bar(ctx, &p);
+                self.library_central(ctx, &p);
+            }
+            Screen::Study => {
+                self.top_bar(ctx, &p);
+                if self.screen == Screen::Study {
+                    self.bottom_bar(ctx, &p);
+                    self.central(ctx, &p);
+                    self.reset_confirm(ctx);
+                } else {
+                    self.library_central(ctx, &p);
+                }
+            }
         }
-        self.central(ctx, &p);
-        drop_overlay(ctx, &p);
+        let adding = self.screen == Screen::Library && self.config.library.is_some();
+        drop_overlay(ctx, &p, adding);
     }
 }
 
-/// Widest a card gets; very long lines are hard to read.
+/// Keep long card lines readable while allowing small windows.
 const CARD_MAX_WIDTH: f32 = 680.0;
-/// Shortest a card gets, so a one-word question still looks like a card.
 const CARD_MIN_HEIGHT: f32 = 240.0;
-/// Room for the window buttons: on macOS the content runs under a
-/// transparent title bar (see `main.rs`).
 const TITLEBAR_INSET: i8 = if cfg!(target_os = "macos") { 28 } else { 0 };
 
+fn top_frame(p: &Palette) -> egui::Frame {
+    egui::Frame::new().fill(p.bg).inner_margin(egui::Margin {
+        left: 20,
+        right: 16,
+        top: TITLEBAR_INSET + 12,
+        bottom: 8,
+    })
+}
+
+fn central_frame(p: &Palette) -> egui::Frame {
+    egui::Frame::new()
+        .fill(p.bg)
+        .inner_margin(egui::Margin::symmetric(24, 8))
+}
+
 impl RunkiApp {
+    fn theme_button(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        if theme_toggle(ui, p, self.theme) {
+            self.theme = theme::next(self.theme);
+            ui.ctx().set_theme(self.theme);
+            ui.ctx().request_discard("theme changed");
+        }
+    }
+
     fn top_bar(&mut self, ctx: &egui::Context, p: &Palette) {
-        let frame = egui::Frame::new().fill(p.bg).inner_margin(egui::Margin {
-            left: 20,
-            right: 16,
-            top: TITLEBAR_INSET + 12,
-            bottom: 8,
-        });
+        let mut go_back = false;
         egui::TopBottomPanel::top("top")
-            .frame(frame)
+            .frame(top_frame(p))
             .show_separator_line(false)
             .show(ctx, |ui| {
-                // One row height, so the name lines up with the controls.
-                ui.spacing_mut().interact_size.y = 30.0;
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme_toggle(ui, p, self.theme) {
-                        self.theme = theme::next(self.theme);
-                        ctx.set_theme(self.theme);
-                        // Redraw at once with the new palette.
-                        ctx.request_discard("theme changed");
-                    }
-                    // The welcome screen has its own Open button.
-                    let Some(deck) = &self.deck else {
-                        return;
-                    };
-                    let name = egui::RichText::new(&deck.name).size(15.0).color(p.text);
-                    let open = egui::Button::new(egui::RichText::new("Open…").color(p.muted));
-                    if ui.add(open).on_hover_text("Open another deck").clicked() {
-                        self.pick_and_open();
-                    }
-                    ui.add_space(4.0);
-                    // Right to left, so the segments are listed last first.
-                    let later = match self.later_count() {
-                        0 => "Later".to_string(),
-                        n => format!("Later  {n}"),
-                    };
-                    let segments = [(Mode::Later, later.as_str()), (Mode::All, "All")];
-                    if let Some(mode) = segmented(ui, p, self.mode, &segments) {
-                        self.set_mode(mode);
-                    }
-                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        ui.add(egui::Label::new(name).truncate());
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        self.theme_button(ui, p);
+                        if ui.button("Open deck…").clicked() {
+                            self.pick_and_open();
+                        }
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            if ui.button("Library").clicked() {
+                                go_back = true;
+                            }
+                            if let Some(session) = &self.session {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&session.deck().name).color(p.text),
+                                    )
+                                    .truncate(),
+                                );
+                            }
+                        });
                     });
                 });
+                let Some(session) = &mut self.session else {
+                    return;
+                };
+                let now = progress::now_ms();
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    let later = match session.later_count() {
+                        0 => "Later".to_owned(),
+                        n => format!("Later ({n})"),
+                    };
+                    let filters = [
+                        (CardFilter::All, "All"),
+                        (CardFilter::Unseen, "Unseen"),
+                        (CardFilter::Later, later.as_str()),
+                    ];
+                    if let Some(filter) = segmented(ui, p, session.filter(), &filters) {
+                        session.set_filter(filter, now);
+                    }
+                    let order = session.card_order();
+                    let order_picker = egui::ComboBox::from_id_salt("card_order")
+                        .selected_text(match order {
+                            CardOrder::Deck => "Deck order",
+                            CardOrder::Shuffled => "Shuffled",
+                        })
+                        .width(110.0)
+                        .show_ui(ui, |ui| {
+                            for (value, label) in [
+                                (CardOrder::Deck, "Deck order"),
+                                (CardOrder::Shuffled, "Shuffled"),
+                            ] {
+                                if ui.selectable_label(order == value, label).clicked() {
+                                    session.set_order(value, now);
+                                }
+                            }
+                        });
+                    order_picker.response.widget_info(|| {
+                        egui::WidgetInfo::labeled(
+                            egui::WidgetType::ComboBox,
+                            ui.is_enabled(),
+                            "Card order",
+                        )
+                    });
+                    if session.card_order() == CardOrder::Shuffled
+                        && ui.button("Reshuffle").clicked()
+                    {
+                        session.reshuffle(now);
+                    }
+                });
             });
+        if go_back {
+            self.go_to_library();
+        }
     }
 
     fn bottom_bar(&mut self, ctx: &egui::Context, p: &Palette) {
-        let flagged = self
-            .current()
-            .map(|(card, _, _)| self.state.is_later(&card.id));
-        let frame = egui::Frame::new().fill(p.bg).inner_margin(egui::Margin {
-            left: 20,
-            right: 20,
-            top: 6,
-            bottom: 18,
+        let current = self.session.as_ref().and_then(|session| {
+            let card = session.current_card()?;
+            Some((session.is_later(&card.id), session.revealed()))
         });
         egui::TopBottomPanel::bottom("bottom")
-            .frame(frame)
+            .frame(egui::Frame::new().fill(p.bg).inner_margin(egui::Margin {
+                left: 12,
+                right: 12,
+                top: 6,
+                bottom: 18,
+            }))
             .show_separator_line(false)
             .show(ctx, |ui| {
-                // Nothing to act on (empty view): keep the bar's height.
-                let Some(flagged) = flagged else {
+                let Some((flagged, revealed)) = current else {
                     ui.add_space(30.0);
                     return;
                 };
                 centered_row(ui, |ui| {
-                    let label = if self.revealed { "Next" } else { "Show answer" };
+                    let label = if revealed { "Next" } else { "Show answer" };
                     if key_hint(ui, p, "Space", label, p.muted).clicked() {
                         self.space();
                     }
@@ -418,74 +619,180 @@ impl RunkiApp {
             });
     }
 
-    fn central(&mut self, ctx: &egui::Context, p: &Palette) {
-        let frame = egui::Frame::new().fill(p.bg).inner_margin(egui::Margin {
-            left: 24,
-            right: 24,
-            top: 8,
-            bottom: 8,
-        });
-        egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
-            let width = ui.available_width().min(CARD_MAX_WIDTH);
-            self.error_banners(ui, p, width);
-
-            if self.deck.is_none() {
-                self.welcome(ui, p);
-                return;
-            }
-
-            let Some((card, n, total)) = self.current() else {
-                let (title, hint) = if self.mode == Mode::Later {
-                    (
-                        "Nothing saved for later",
-                        "Press L on any card to keep it here.",
-                    )
-                } else {
-                    ("This deck has no cards", "Try opening another deck.")
-                };
-                let height = ui.available_height();
-                centered_v(ui, height, |ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.label(egui::RichText::new(title).size(20.0).color(p.text));
-                        ui.label(egui::RichText::new(hint).color(p.muted));
-                    });
-                });
-                return;
-            };
-            let flagged = self.state.is_later(&card.id);
-            let (front, back) = (card.front.clone(), card.back.clone());
-
-            let height = ui.available_height();
-            let mut card_clicked = false;
-            egui::ScrollArea::vertical()
-                .auto_shrink(false)
-                .show(ui, |ui| {
-                    centered_v(ui, height, |ui| {
-                        ui.vertical_centered(|ui| {
-                            card_clicked = study_card(
-                                ui,
-                                p,
-                                width,
-                                &front,
-                                self.revealed.then_some(back.as_str()),
-                                flagged,
-                            );
-                            ui.add_space(12.0);
-                            progress_row(ui, p, n, total);
+    fn library_top_bar(&mut self, ctx: &egui::Context, p: &Palette) {
+        egui::TopBottomPanel::top("library_top")
+            .frame(top_frame(p))
+            .show_separator_line(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        self.theme_button(ui, p);
+                        ui.label(
+                            egui::RichText::new(format!("v{VERSION}"))
+                                .size(12.0)
+                                .color(p.muted),
+                        );
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.label(egui::RichText::new("Library").size(18.0).color(p.text));
                         });
                     });
                 });
-            if card_clicked {
-                self.space();
-            }
+                if let Some(dir) = self.config.library.clone() {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(dir.display().to_string())
+                                .size(12.0)
+                                .color(p.muted),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(dir.display().to_string());
+                    ui.horizontal_wrapped(|ui| {
+                        let add =
+                            egui::Button::new(egui::RichText::new("Add deck…").color(p.on_accent))
+                                .fill(p.accent);
+                        if ui.add(add).clicked() {
+                            self.add_decks_via_picker();
+                        }
+                        if ui.button("Refresh").clicked() {
+                            self.rescan_library();
+                        }
+                        if ui.button("Change folder…").clicked() {
+                            self.choose_library_folder();
+                        }
+                        if ui.button("Open deck…").clicked() {
+                            self.pick_and_open();
+                        }
+                    });
+                }
+            });
+    }
+
+    fn library_central(&mut self, ctx: &egui::Context, p: &Palette) {
+        egui::CentralPanel::default()
+            .frame(central_frame(p))
+            .show(ctx, |ui| {
+                let width = ui.available_width().min(CARD_MAX_WIDTH);
+                self.error_banners(ui, p, width);
+                if self.config.library.is_none() {
+                    self.welcome(ui, p);
+                    return;
+                }
+                if let Some(error) = self.library_error.clone() {
+                    ui.add(egui::Label::new(egui::RichText::new(error).color(p.danger)).wrap());
+                    if ui.button("Choose another folder…").clicked() {
+                        self.choose_library_folder();
+                    }
+                    return;
+                }
+                self.library_list(ui, p);
+            });
+    }
+
+    /// First launch always lets the user choose the library folder.
+    fn welcome(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let height = ui.available_height();
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            centered_v(ui, height, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.label(egui::RichText::new("Runki").size(36.0).color(p.text));
+                    ui.label(egui::RichText::new("Flip through your decks. Nothing to grade.").color(p.muted));
+                    ui.add_space(24.0);
+                    let choose = egui::Button::new(egui::RichText::new("Choose a library folder…").color(p.on_accent))
+                        .fill(p.accent).min_size(egui::vec2(220.0, 40.0));
+                    if ui.add(choose).clicked() { self.choose_library_folder(); }
+                    ui.add_space(4.0);
+                    ui.add(egui::Label::new(egui::RichText::new(
+                        "Any folder works. Choose one in iCloud Drive or Dropbox to sync decks and progress between Macs."
+                    ).size(12.0).color(p.muted)).wrap());
+                    ui.add_space(16.0);
+                    if ui.button("Open deck…").clicked() { self.pick_and_open(); }
+                    ui.label(egui::RichText::new("or drop an .apkg, .csv, .tsv or .txt file here").size(12.0).color(p.muted));
+                });
+            });
         });
+    }
+
+    fn library_list(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        if self.library_entries.is_empty() {
+            let height = ui.available_height();
+            centered_v(ui, height, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        egui::RichText::new("Your library starts here")
+                            .size(20.0)
+                            .color(p.text),
+                    );
+                    ui.label(
+                        egui::RichText::new("Use Add deck… or drop deck files into this window.")
+                            .color(p.muted),
+                    );
+                });
+            });
+            return;
+        }
+        let now = progress::now_ms();
+        let width = ui.available_width().min(800.0);
+        let mut to_open = None;
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            ui.vertical_centered(|ui| {
+                for entry in &self.library_entries {
+                    ui.push_id(&entry.path, |ui| {
+                        let ready = matches!(entry.status, DeckStatus::Ready { .. });
+                        let row = ui.allocate_ui(egui::vec2(width, 0.0), |ui| {
+                            egui::Frame::new().fill(p.surface).stroke(egui::Stroke::new(1.0, p.line))
+                                .corner_radius(12).inner_margin(16).show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                                        ui.vertical(|ui| {
+                                            let color = if entry.status == DeckStatus::NotDownloaded { p.muted } else { p.text };
+                                            ui.add(egui::Label::new(egui::RichText::new(&entry.display_name).size(16.0).color(color)).wrap());
+                                            match &entry.status {
+                                                DeckStatus::Loading => { ui.horizontal(|ui| { ui.spinner(); ui.label(egui::RichText::new("Loading…").color(p.muted)); }); }
+                                                DeckStatus::Ready { total, seen, later } => {
+                                                    ui.horizontal_wrapped(|ui| {
+                                                        ui.label(egui::RichText::new(format!("{total} cards")).size(12.0).color(p.muted));
+                                                        ui.label(egui::RichText::new(format!("{seen} / {total} seen")).size(12.0).color(p.muted));
+                                                        ui.label(egui::RichText::new(format!("{later} for later")).size(12.0).color(if *later > 0 { p.accent } else { p.muted }));
+                                                        ui.label(egui::RichText::new(format!("Last opened: {}", library::last_opened_label(entry.opened_at, now))).size(12.0).color(p.muted));
+                                                    });
+                                                    let fraction = *seen as f32 / (*total).max(1) as f32;
+                                                    let (track, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 3.0), egui::Sense::hover());
+                                                    ui.painter().rect_filled(track, 2, p.line);
+                                                    if fraction > 0.0 {
+                                                        let fill = egui::Rect::from_min_size(track.min, egui::vec2(track.width() * fraction, track.height()));
+                                                        ui.painter().rect_filled(fill, 2, p.accent);
+                                                    }
+                                                }
+                                                DeckStatus::Failed(error) => { ui.add(egui::Label::new(egui::RichText::new(error).color(p.danger)).wrap()); }
+                                                DeckStatus::NotDownloaded => {
+                                                    ui.label(egui::RichText::new("Not downloaded – open in Finder to download").size(12.0).color(p.muted));
+                                                    #[cfg(target_os = "macos")]
+                                                    if ui.small_button("Show in Finder").clicked() { show_in_finder(&entry.path); }
+                                                }
+                                            }
+                                        });
+                                    });
+                                });
+                        });
+                        if ready {
+                            let response = row.response.interact(egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+                            if response.hovered() { ui.painter().rect_stroke(response.rect, 12, egui::Stroke::new(1.0, p.accent), egui::StrokeKind::Inside); }
+                            if response.clicked() { to_open = Some(entry.path.clone()); }
+                        }
+                    });
+                    ui.add_space(4.0);
+                }
+            });
+        });
+        if let Some(path) = to_open {
+            self.open_path(path);
+        }
     }
 
     fn error_banners(&mut self, ui: &mut egui::Ui, p: &Palette, width: f32) {
         for slot in [&mut self.error, &mut self.save_error] {
-            let Some(error) = slot.clone() else {
-                continue;
-            };
+            let Some(error) = slot.clone() else { continue };
             ui.vertical_centered(|ui| {
                 ui.allocate_ui(egui::vec2(width, 0.0), |ui| {
                     egui::Frame::new()
@@ -495,18 +802,27 @@ impl RunkiApp {
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                                let close = egui::Button::new(
-                                    egui::RichText::new("×").size(18.0).color(p.danger),
-                                )
-                                .frame(false);
-                                if ui.add(close).on_hover_text("Dismiss").clicked() {
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new("×").size(18.0).color(p.danger),
+                                        )
+                                        .frame(false),
+                                    )
+                                    .on_hover_text("Dismiss")
+                                    .clicked()
+                                {
                                     *slot = None;
                                 }
                                 ui.with_layout(
                                     egui::Layout::left_to_right(egui::Align::Min),
                                     |ui| {
-                                        let text = egui::RichText::new(error).color(p.danger);
-                                        ui.add(egui::Label::new(text).wrap());
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(error).color(p.danger),
+                                            )
+                                            .wrap(),
+                                        );
                                     },
                                 );
                             });
@@ -517,47 +833,155 @@ impl RunkiApp {
         }
     }
 
-    fn welcome(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        let height = ui.available_height();
-        centered_v(ui, height, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.label(egui::RichText::new("Runki").size(36.0).color(p.text));
-                ui.label(
-                    egui::RichText::new("Flip through your decks. Nothing to grade.")
-                        .color(p.muted),
-                );
-                ui.add_space(28.0);
-                let open = egui::Button::new(
-                    egui::RichText::new("Open deck")
-                        .size(15.0)
-                        .color(p.on_accent),
-                )
-                .fill(p.accent)
-                .corner_radius(10)
-                .min_size(egui::vec2(160.0, 40.0));
-                if ui
-                    .add(open)
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+    fn seen_row(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let Some(session) = &self.session else { return };
+        let seen = session.seen_count();
+        let total = session.total();
+        centered_row(ui, |ui| {
+            ui.label(
+                egui::RichText::new(format!("{seen} / {total} seen"))
+                    .size(12.0)
+                    .color(p.muted),
+            );
+            if seen > 0
+                && ui
+                    .small_button("Reset…")
+                    .on_hover_text("Clear which cards you have seen")
                     .clicked()
-                {
-                    self.pick_and_open();
-                }
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new("or drop an .apkg, .csv, .tsv or .txt file here")
-                        .size(12.0)
-                        .color(p.muted),
-                );
-                ui.add_space(40.0);
-                centered_row(ui, |ui| {
-                    keycap(ui, p, "Space");
-                    ui.label(egui::RichText::new("answer, then next").color(p.muted));
-                    ui.add_space(16.0);
-                    keycap(ui, p, "L");
-                    ui.label(egui::RichText::new("study later").color(p.muted));
-                });
-            });
+            {
+                self.show_reset_confirm = true;
+            }
         });
+    }
+
+    fn central(&mut self, ctx: &egui::Context, p: &Palette) {
+        egui::CentralPanel::default()
+            .frame(central_frame(p))
+            .show(ctx, |ui| {
+                let width = ui.available_width().min(CARD_MAX_WIDTH);
+                self.error_banners(ui, p, width);
+                let height = ui.available_height();
+                let Some((card, n, total)) = self.current() else {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink(false)
+                        .show(ui, |ui| {
+                            centered_v(ui, height, |ui| {
+                                ui.vertical_centered(|ui| {
+                                    let Some(session) = &self.session else { return };
+                                    match session.filter() {
+                                        CardFilter::Unseen => {
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "You've seen all {} cards",
+                                                    session.total()
+                                                ))
+                                                .size(20.0)
+                                                .color(p.text),
+                                            );
+                                            if ui.button("Reset progress").clicked() {
+                                                self.show_reset_confirm = true;
+                                            }
+                                        }
+                                        CardFilter::Later => {
+                                            ui.label(
+                                                egui::RichText::new("Nothing saved for later")
+                                                    .size(20.0)
+                                                    .color(p.text),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(
+                                                    "Press L on any card to keep it here.",
+                                                )
+                                                .color(p.muted),
+                                            );
+                                        }
+                                        CardFilter::All => {
+                                            ui.label(
+                                                egui::RichText::new("This deck has no cards")
+                                                    .size(20.0)
+                                                    .color(p.text),
+                                            );
+                                        }
+                                    }
+                                    if session.filter() == CardFilter::Later {
+                                        self.seen_row(ui, p);
+                                    }
+                                });
+                            });
+                        });
+                    return;
+                };
+                let session = self.session.as_ref().expect("session for current card");
+                let flagged = session.is_later(&card.id);
+                let revealed = session.revealed();
+                let (front, back) = (card.front.clone(), card.back.clone());
+                let mut card_clicked = false;
+                egui::ScrollArea::vertical()
+                    .auto_shrink(false)
+                    .show(ui, |ui| {
+                        centered_v(ui, height, |ui| {
+                            ui.vertical_centered(|ui| {
+                                card_clicked = study_card(
+                                    ui,
+                                    p,
+                                    width,
+                                    CARD_MIN_HEIGHT.min((height - 90.0).max(120.0)),
+                                    &front,
+                                    revealed.then_some(back.as_str()),
+                                    flagged,
+                                );
+                                ui.add_space(12.0);
+                                progress_row(ui, p, n, total);
+                                self.seen_row(ui, p);
+                            });
+                        });
+                    });
+                if card_clicked && !self.show_reset_confirm {
+                    self.space();
+                }
+            });
+    }
+
+    /// Confirmation dialog for clearing a deck's seen marks.
+    fn reset_confirm(&mut self, ctx: &egui::Context) {
+        if !self.show_reset_confirm {
+            return;
+        }
+        let response = egui::Modal::new(egui::Id::new("reset_progress")).show(ctx, |ui| {
+            ui.heading("Reset progress?");
+            ui.add_space(8.0);
+            ui.label(
+                "This clears which cards you have seen in this deck. \
+                 Study-later flags are kept.",
+            );
+            ui.add_space(16.0);
+            let mut choice = None;
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    choice = Some(false);
+                }
+                if ui.button("Reset progress").clicked() {
+                    choice = Some(true);
+                }
+            });
+            choice
+        });
+        match response.inner {
+            Some(true) => {
+                if let Some(session) = &mut self.session {
+                    session.reset(progress::now_ms());
+                }
+                self.show_reset_confirm = false;
+            }
+            Some(false) => {
+                self.show_reset_confirm = false;
+            }
+            None => {
+                if response.backdrop_response.clicked() {
+                    self.show_reset_confirm = false;
+                }
+            }
+        }
     }
 }
 
@@ -567,6 +991,7 @@ fn study_card(
     ui: &mut egui::Ui,
     p: &Palette,
     width: f32,
+    min_height: f32,
     front: &str,
     back: Option<&str>,
     flagged: bool,
@@ -585,7 +1010,7 @@ fn study_card(
             .inner_margin(egui::Margin::symmetric(40, 36))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                centered_v(ui, CARD_MIN_HEIGHT - 72.0, |ui| {
+                centered_v(ui, min_height - 72.0, |ui| {
                     ui.vertical_centered(|ui| {
                         let front = egui::RichText::new(front).size(26.0).color(p.text);
                         ui.add(egui::Label::new(front).wrap());
@@ -735,7 +1160,7 @@ fn key_hint(
 /// Lay out a row centred horizontally, using the width it measured on
 /// the previous pass (a changed width triggers one discarded pass).
 fn centered_row(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
-    let id = ui.id().with("centered_row");
+    let id = ui.next_auto_id().with("centered_row");
     let last: f32 = ui.ctx().data(|d| d.get_temp(id)).unwrap_or(0.0);
     let pad = ((ui.available_width() - last) / 2.0).max(0.0);
     ui.horizontal(|ui| {
@@ -748,13 +1173,15 @@ fn centered_row(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
 /// Lay out contents centred vertically in `height`, using the height
 /// measured on the previous pass, and take up at least `height`.
 fn centered_v(ui: &mut egui::Ui, height: f32, add_contents: impl FnOnce(&mut egui::Ui)) {
-    let id = ui.id().with("centered_v");
+    let start = ui.next_widget_position().y;
+    let id = ui.next_auto_id().with("centered_v");
     let last: f32 = ui.ctx().data(|d| d.get_temp(id)).unwrap_or(0.0);
     let pad = ((height - last) / 2.0).max(0.0);
     ui.add_space(pad);
     let measured = ui.vertical(add_contents).response.rect.height();
     remember_size(ui, id, last, measured);
-    ui.add_space((height - pad - measured).max(0.0));
+    let used = ui.next_widget_position().y - start;
+    ui.add_space((height - used).max(0.0));
 }
 
 fn remember_size(ui: &egui::Ui, id: egui::Id, last: f32, measured: f32) {
@@ -765,7 +1192,7 @@ fn remember_size(ui: &egui::Ui, id: egui::Id, last: f32, measured: f32) {
 }
 
 /// While a file is dragged over the window, say it can be dropped.
-fn drop_overlay(ctx: &egui::Context, p: &Palette) {
+fn drop_overlay(ctx: &egui::Context, p: &Palette, adding: bool) {
     if ctx.input(|i| i.raw.hovered_files.is_empty()) {
         return;
     }
@@ -784,7 +1211,11 @@ fn drop_overlay(ctx: &egui::Context, p: &Palette) {
     painter.text(
         screen.center(),
         egui::Align2::CENTER_CENTER,
-        "Drop to open",
+        if adding {
+            "Drop to add to library"
+        } else {
+            "Drop to open"
+        },
         egui::FontId::proportional(20.0),
         p.accent,
     );
@@ -793,7 +1224,8 @@ fn drop_overlay(ctx: &egui::Context, p: &Palette) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::deck::Card;
+    use crate::deck::{Card, Deck};
+    use crate::progress::DeckState;
 
     struct TempDir(std::path::PathBuf);
 
@@ -803,13 +1235,7 @@ mod tests {
         }
     }
 
-    fn test_app(
-        test_name: &str,
-        later: &[&str],
-        mode: Mode,
-        pos: usize,
-        revealed: bool,
-    ) -> (RunkiApp, TempDir) {
+    fn test_app(test_name: &str, later: &[&str]) -> (RunkiApp, TempDir) {
         let dir =
             std::env::temp_dir().join(format!("runki-test-{}-{}", test_name, std::process::id()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
@@ -828,122 +1254,178 @@ mod tests {
             state.set_later(id, true, 0);
         }
         let state_path = progress::state_path(&deck_path, None);
-        let app = RunkiApp {
-            theme: egui::ThemePreference::System,
-            deck: Some(Deck {
+        let session = StudySession::new(
+            Deck {
                 name: "test".to_string(),
                 path: deck_path,
                 cards,
-            }),
-            pos,
-            revealed,
-            mode,
+            },
             state,
-            state_path: Some(state_path),
-            save_blocked: false,
-            dirty: false,
+            state_path,
+            false,
+            1_000,
+        );
+        let app = RunkiApp {
+            config: Config::default(),
+            theme: egui::ThemePreference::System,
+            screen: Screen::Study,
+            library_entries: Vec::new(),
+            library_error: None,
+            loader: None,
+            session: Some(session),
             last_save_attempt: None,
+            show_reset_confirm: false,
             error: None,
             save_error: None,
         };
         (app, guard)
     }
 
-    #[test]
-    fn later_unflag_first_hides_next_cards_answer() {
-        let (mut app, _temp) =
-            test_app("later-unflag-first", &["a", "b", "c"], Mode::Later, 0, true);
+    fn session(app: &RunkiApp) -> &StudySession {
+        app.session.as_ref().expect("session")
+    }
 
-        app.toggle_later();
+    #[derive(Default)]
+    struct MemoryStorage(std::collections::HashMap<String, String>);
 
-        assert_eq!(app.pos, 0);
-        assert!(!app.revealed);
-        let (card, _, _) = app.current().expect("next card shown");
-        assert_eq!(card.id, "b");
+    impl eframe::Storage for MemoryStorage {
+        fn get_string(&self, key: &str) -> Option<String> {
+            self.0.get(key).cloned()
+        }
+
+        fn set_string(&mut self, key: &str, value: String) {
+            self.0.insert(key.to_owned(), value);
+        }
+
+        fn flush(&mut self) {}
     }
 
     #[test]
-    fn later_unflag_middle_hides_next_cards_answer() {
-        let (mut app, _temp) = test_app(
-            "later-unflag-middle",
-            &["a", "b", "c"],
-            Mode::Later,
-            1,
-            true,
+    fn app_save_preserves_library_theme_and_deck_progress() {
+        let (mut app, temp) = test_app("save-all-settings", &[]);
+        app.config.library = Some(temp.0.clone());
+        app.config.last_open_deck = Some(session(&app).deck().path.clone());
+        app.theme = egui::ThemePreference::Light;
+        app.toggle_later();
+
+        let mut storage = MemoryStorage::default();
+        eframe::App::save(&mut app, &mut storage);
+
+        let restored: Config = eframe::get_value(&storage, CONFIG_KEY).expect("saved config");
+        assert_eq!(restored, app.config);
+        assert_eq!(theme::load(Some(&storage)), egui::ThemePreference::Light);
+        assert!(
+            !session(&app).dirty(),
+            "app save also flushes deck progress"
         );
-
-        app.toggle_later();
-
-        assert_eq!(app.pos, 1);
-        assert!(!app.revealed);
-        let (card, _, _) = app.current().expect("next card shown");
-        assert_eq!(card.id, "c");
+        assert!(session(&app).state_path().exists());
+        assert!(
+            !eframe::App::persist_egui_memory(&app),
+            "styles are rebuilt on launch"
+        );
     }
 
     #[test]
-    fn later_unflag_last_remaining_empties_view() {
-        let (mut app, _temp) = test_app("later-unflag-last", &["a"], Mode::Later, 0, true);
+    fn existing_config_without_a_theme_follows_the_system() {
+        let config = Config {
+            library: Some(PathBuf::from("existing-library")),
+            last_open_deck: Some(PathBuf::from("existing-library/deck.tsv")),
+        };
+        let mut storage = MemoryStorage::default();
+        eframe::set_value(&mut storage, CONFIG_KEY, &config);
 
-        app.toggle_later();
+        assert_eq!(theme::load(Some(&storage)), egui::ThemePreference::System);
+        assert_eq!(
+            eframe::get_value::<Config>(&storage, CONFIG_KEY),
+            Some(config)
+        );
+    }
 
-        assert_eq!(app.pos, 0);
-        assert!(!app.revealed);
-        assert!(app.current().is_none());
-        assert_eq!(app.view_len(), 0);
+    #[test]
+    fn study_layout_settles_at_normal_and_minimum_window_sizes() {
+        let (mut app, _temp) = test_app("study-layout", &["a"]);
+        app.space();
+        app.session
+            .as_mut()
+            .expect("session")
+            .set_order(CardOrder::Shuffled, 2_000);
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        for size in [egui::vec2(900.0, 650.0), egui::vec2(520.0, 400.0)] {
+            for frame in 0..8 {
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        let p = Palette::of(ctx);
+                        app.top_bar(ctx, &p);
+                        assert!(
+                            ctx.available_rect().top() < 180.0,
+                            "header leaves room for the card"
+                        );
+                        app.bottom_bar(ctx, &p);
+                        app.central(ctx, &p);
+                    },
+                );
+                if frame == 7 {
+                    assert_eq!(
+                        output.platform_output.num_completed_passes, 1,
+                        "layout converges without repeated measurement"
+                    );
+                    assert!(!output.platform_output.requested_discard());
+                }
+            }
+        }
     }
 
     #[test]
     fn later_count_ignores_stale_ids() {
-        let (app, _temp) = test_app(
-            "later-count-stale",
-            &["a", "stale-1", "stale-2"],
-            Mode::All,
-            0,
-            false,
-        );
+        let (app, _temp) = test_app("later-count-stale", &["a", "stale-1", "stale-2"]);
 
-        assert_eq!(app.later_count(), 1);
+        assert_eq!(session(&app).later_count(), 1);
         // Stale ids are not deleted from the in-memory state (or file).
-        assert_eq!(app.state.later.len(), 3);
-        assert!(app.state.is_later("stale-1"));
+        assert_eq!(session(&app).state().later.len(), 3);
+        assert!(session(&app).state().is_later("stale-1"));
     }
 
     #[test]
     fn error_cleared_after_successful_save() {
-        let (mut app, _temp) = test_app("error-cleared-on-save", &[], Mode::All, 0, false);
+        let (mut app, _temp) = test_app("error-cleared-on-save", &[]);
         // Make the first save fail by occupying the sidecar path with a dir.
-        let deck_path = app.deck.as_ref().expect("deck").path.clone();
+        let deck_path = session(&app).deck().path.clone();
         let sidecar = progress::state_path(&deck_path, None);
         std::fs::create_dir_all(&sidecar).expect("create blocking dir");
 
         app.toggle_later();
         app.save_now();
         assert!(app.save_error.is_some(), "failed save should set error");
-        assert!(app.dirty, "failed save stays dirty for a retry");
+        assert!(session(&app).dirty(), "failed save stays dirty");
 
         std::fs::remove_dir_all(&sidecar).expect("remove blocking dir");
         app.toggle_later();
         app.save_now();
         assert_eq!(app.save_error, None, "successful save should clear error");
-        assert!(!app.dirty);
+        assert!(!session(&app).dirty());
     }
 
     #[test]
     fn successful_save_keeps_unrelated_error() {
-        let (mut app, _temp) = test_app("save-keeps-error", &[], Mode::All, 0, false);
+        let (mut app, _temp) = test_app("save-keeps-error", &[]);
         app.error = Some("Could not open other.apkg".to_string());
 
         app.toggle_later();
         app.save_now();
 
-        assert!(!app.dirty);
+        assert!(!session(&app).dirty());
         assert_eq!(app.error.as_deref(), Some("Could not open other.apkg"));
     }
 
     #[test]
     fn failed_save_on_deck_switch_is_reported() {
-        let (mut app, temp) = test_app("switch-save-fails", &[], Mode::All, 0, false);
-        let deck_path = app.deck.as_ref().expect("deck").path.clone();
+        let (mut app, temp) = test_app("switch-save-fails", &[]);
+        let deck_path = session(&app).deck().path.clone();
         // Make saving the outgoing deck fail.
         std::fs::create_dir_all(progress::state_path(&deck_path, None))
             .expect("create blocking dir");
@@ -962,45 +1444,9 @@ mod tests {
     }
 
     #[test]
-    fn all_toggle_flag_keeps_answer_shown_on_same_card() {
-        let (mut app, _temp) = test_app("all-toggle-flag", &[], Mode::All, 0, true);
-
-        app.toggle_later();
-
-        assert!(app.revealed);
-        assert!(app.state.is_later("a"));
-        let (card, _, _) = app.current().expect("card shown");
-        assert_eq!(card.id, "a");
-
-        app.toggle_later();
-
-        assert!(app.revealed);
-        assert!(!app.state.is_later("a"));
-        let (card, _, _) = app.current().expect("card shown");
-        assert_eq!(card.id, "a");
-    }
-
-    #[test]
-    fn reveal_marks_card_seen() {
-        let (mut app, _temp) = test_app("reveal-marks-seen", &[], Mode::All, 0, false);
-        assert!(!app.state.is_seen("a"));
-
-        app.space();
-
-        assert!(app.revealed);
-        assert!(app.state.is_seen("a"), "revealing marks the card seen");
-        assert!(app.dirty);
-
-        // Advancing does not mark the next card.
-        app.space();
-        assert!(!app.revealed);
-        assert!(!app.state.is_seen("b"));
-    }
-
-    #[test]
     fn debounced_save_writes_file() {
-        let (mut app, _temp) = test_app("debounced-save", &[], Mode::All, 0, false);
-        let state_path = app.state_path.clone().expect("state path");
+        let (mut app, _temp) = test_app("debounced-save", &[]);
+        let state_path = session(&app).state_path().clone();
         assert!(!state_path.exists());
 
         // First save attempt is immediate (nothing attempted yet).
@@ -1008,7 +1454,7 @@ mod tests {
         app.toggle_later();
         assert_eq!(app.maybe_save_debounced_at(now), None);
         assert!(state_path.exists(), "debounced save writes the file");
-        assert!(!app.dirty);
+        assert!(!session(&app).dirty());
 
         // A new change inside the interval waits, then saves once due.
         app.toggle_later();
@@ -1016,10 +1462,10 @@ mod tests {
             .maybe_save_debounced_at(now + Duration::from_secs(1))
             .expect("pending save should schedule a retry");
         assert_eq!(delay, Duration::from_secs(1));
-        assert!(app.dirty);
+        assert!(session(&app).dirty());
         app.maybe_save_debounced_at(now + Duration::from_secs(2));
-        assert!(!app.dirty);
-        let loaded = progress::load(&app.deck.as_ref().expect("deck").path, &state_path);
+        assert!(!session(&app).dirty());
+        let loaded = progress::load(&session(&app).deck().path, &state_path);
         assert!(!loaded.state().is_later("a"), "second toggle was saved");
     }
 
@@ -1034,19 +1480,17 @@ mod tests {
         let second = dir.join("second.tsv");
         std::fs::write(&second, "Q2\tA2\n").expect("write second deck");
 
-        let mut app = RunkiApp::new(Some(first.clone()));
-        assert!(app.state.opened_at > 0, "opening stamps opened_at");
+        let mut app = RunkiApp::new(Config::default(), Some(first.clone()));
+        assert!(
+            session(&app).state().opened_at > 0,
+            "opening stamps opened_at"
+        );
         app.space();
         app.open_path(second);
 
         let first_state = progress::state_path(&first, None);
         assert!(first_state.exists(), "switching saved the first deck");
         let loaded = progress::load(&first, &first_state);
-        assert_eq!(
-            loaded.state().seen_count(["x"].into_iter()),
-            0,
-            "sanity: unknown ids are not seen"
-        );
         assert!(
             loaded.state().seen.values().any(|&t| t > 0),
             "seen mark was saved on switch"
@@ -1071,9 +1515,9 @@ mod tests {
         std::fs::write(&legacy, corrupt).expect("write corrupt legacy file");
         let state_path = progress::state_path(&deck_path, None);
 
-        let mut app = RunkiApp::new(Some(deck_path));
-        assert!(app.deck.is_some(), "deck still opens");
-        assert!(app.save_blocked);
+        let mut app = RunkiApp::new(Config::default(), Some(deck_path));
+        assert!(app.session.is_some(), "deck still opens");
+        assert!(session(&app).save_blocked());
         assert!(
             app.error
                 .as_deref()
@@ -1086,7 +1530,7 @@ mod tests {
         app.save_now();
 
         assert_eq!(
-            app.state.later.len(),
+            session(&app).state().later.len(),
             1,
             "toggle still updates in-memory state"
         );
@@ -1114,8 +1558,8 @@ mod tests {
         let state_path = progress::state_path(&deck_path, None);
         std::fs::write(&state_path, corrupt).expect("write corrupt state");
 
-        let mut app = RunkiApp::new(Some(deck_path));
-        assert!(app.save_blocked);
+        let mut app = RunkiApp::new(Config::default(), Some(deck_path));
+        assert!(session(&app).save_blocked());
 
         app.toggle_later();
         app.space();
@@ -1146,11 +1590,11 @@ mod tests {
         let good_path = dir.join("good.tsv");
         std::fs::write(&good_path, "Q1\tA1\n").expect("write good deck");
 
-        let mut app = RunkiApp::new(Some(bad_path));
-        assert!(app.save_blocked);
+        let mut app = RunkiApp::new(Config::default(), Some(bad_path));
+        assert!(session(&app).save_blocked());
 
         app.open_path(good_path.clone());
-        assert!(!app.save_blocked);
+        assert!(!session(&app).save_blocked());
         assert!(app.error.is_none());
 
         app.toggle_later();
@@ -1161,5 +1605,112 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn library_deck_opened_by_path_uses_runki_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "runki-test-library-state-path-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("create library");
+        let deck_path = library.join("deck.tsv");
+        std::fs::write(&deck_path, "Q1\tA1\n").expect("write deck");
+
+        let config = Config {
+            library: Some(library.clone()),
+            last_open_deck: None,
+        };
+        // Opened by path (as a CLI deck would be), not via a row click.
+        let mut app = RunkiApp::new(config, Some(deck_path.clone()));
+        assert_eq!(app.screen(), Screen::Study);
+        assert_eq!(app.config().last_open_deck.as_ref(), Some(&deck_path));
+
+        let library_state = library.join(".runki").join("deck.tsv.json");
+        assert_eq!(session(&app).state_path(), &library_state);
+
+        app.toggle_later();
+        app.save_now();
+        assert!(library_state.exists(), "progress saved under .runki/");
+        assert!(
+            !progress::state_path(&deck_path, None).exists(),
+            "no sidecar for a library deck"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn starts_on_library_and_goes_back_with_rescan() {
+        let dir =
+            std::env::temp_dir().join(format!("runki-test-start-screen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("create library");
+        let deck_path = library.join("deck.tsv");
+        std::fs::write(&deck_path, "Q1\tA1\n").expect("write deck");
+
+        let config = Config {
+            library: Some(library.clone()),
+            last_open_deck: Some(deck_path.clone()),
+        };
+        // Even with a remembered deck, the start screen is the
+        // library (only a CLI deck auto-opens), already scanned.
+        let mut app = RunkiApp::new(config, None);
+        assert_eq!(app.screen(), Screen::Library);
+        assert!(app.session.is_none());
+        assert_eq!(app.library_entries.len(), 1);
+        assert_eq!(app.library_entries[0].display_name, "deck");
+        assert!(app.library_error.is_none());
+
+        app.open_path(deck_path.clone());
+        assert_eq!(app.screen(), Screen::Study);
+        app.space(); // Mark the only card seen.
+
+        app.go_to_library();
+        assert_eq!(app.screen(), Screen::Library);
+        assert!(app.session.is_none());
+        assert_eq!(app.library_entries.len(), 1, "rescanned on the way back");
+        assert_eq!(
+            app.library_entries[0].opened_at, 0,
+            "scan no longer reads state; the loader supplies opened_at"
+        );
+        let saved = progress::load(
+            &deck_path,
+            &progress::state_path(&deck_path, Some(&library)),
+        );
+        assert!(
+            saved.state().opened_at > 0,
+            "the saved opened_at is on disk for the loader to report"
+        );
+        assert!(
+            saved.state().seen.values().any(|&t| t > 0),
+            "going back saved the session"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_library_folder_is_shown_as_error() {
+        let dir =
+            std::env::temp_dir().join(format!("runki-test-missing-library-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = Config {
+            library: Some(dir),
+            last_open_deck: None,
+        };
+        let app = RunkiApp::new(config, None);
+        assert_eq!(app.screen(), Screen::Library);
+        assert!(
+            app.library_error
+                .as_deref()
+                .is_some_and(|e| e.contains("Could not read library folder")),
+            "scan failure is kept for the library view: {:?}",
+            app.library_error
+        );
+        assert!(app.library_entries.is_empty());
     }
 }

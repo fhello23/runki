@@ -287,7 +287,7 @@ pub fn parse_delimited(bytes: &[u8], delimiter: u8) -> Result<Vec<Card>> {
 }
 
 /// Stable FNV-1a hash (the std hasher is not stable across runs/releases).
-fn fnv1a(text: &str) -> u64 {
+pub(crate) fn fnv1a(text: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in text.as_bytes() {
         hash ^= u64::from(*byte);
