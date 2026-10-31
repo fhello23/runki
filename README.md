@@ -1,5 +1,7 @@
 # Runki
 
+[![CI](https://github.com/fhello23/runki/actions/workflows/ci.yml/badge.svg)](https://github.com/fhello23/runki/actions/workflows/ci.yml)
+
 A minimal Anki deck viewer written in Rust. No spaced repetition, no
 grading, no limits: open a deck and spacebar through it for as long as
 you want. The only extra is a "study later" list.
