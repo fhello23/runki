@@ -125,9 +125,11 @@ impl RunkiApp {
         let view_len = self.view().len();
         if view_len == 0 {
             self.pos = 0;
-            self.revealed = false;
         } else if self.pos >= view_len {
             self.pos = view_len - 1;
+        }
+        // If a different card is now shown, hide its answer.
+        if self.current().map(|(c, _, _)| c.id) != Some(card.id) {
             self.revealed = false;
         }
     }
@@ -314,6 +316,111 @@ impl RunkiApp {
                 });
             });
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::deck::Card;
+
+    fn test_app(
+        test_name: &str,
+        later: &[&str],
+        mode: Mode,
+        pos: usize,
+        revealed: bool,
+    ) -> RunkiApp {
+        let dir = std::env::temp_dir()
+            .join(format!("runki-test-{}-{}", test_name, std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cards = ["a", "b", "c"]
+            .into_iter()
+            .map(|id| Card {
+                id: id.to_string(),
+                front: format!("front {id}"),
+                back: format!("back {id}"),
+            })
+            .collect();
+        RunkiApp {
+            deck: Some(Deck {
+                name: "test".to_string(),
+                path: dir.join("deck.csv"),
+                cards,
+            }),
+            pos,
+            revealed,
+            mode,
+            later: later.iter().map(|id| (*id).to_string()).collect(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn later_unflag_first_hides_next_cards_answer() {
+        let mut app = test_app(
+            "later-unflag-first",
+            &["a", "b", "c"],
+            Mode::Later,
+            0,
+            true,
+        );
+
+        app.toggle_later();
+
+        assert_eq!(app.pos, 0);
+        assert!(!app.revealed);
+        let (card, _, _) = app.current().expect("next card shown");
+        assert_eq!(card.id, "b");
+    }
+
+    #[test]
+    fn later_unflag_middle_hides_next_cards_answer() {
+        let mut app = test_app(
+            "later-unflag-middle",
+            &["a", "b", "c"],
+            Mode::Later,
+            1,
+            true,
+        );
+
+        app.toggle_later();
+
+        assert_eq!(app.pos, 1);
+        assert!(!app.revealed);
+        let (card, _, _) = app.current().expect("next card shown");
+        assert_eq!(card.id, "c");
+    }
+
+    #[test]
+    fn later_unflag_last_remaining_empties_view() {
+        let mut app = test_app("later-unflag-last", &["a"], Mode::Later, 0, true);
+
+        app.toggle_later();
+
+        assert_eq!(app.pos, 0);
+        assert!(!app.revealed);
+        assert!(app.current().is_none());
+        assert!(app.view().is_empty());
+    }
+
+    #[test]
+    fn all_toggle_flag_keeps_answer_shown_on_same_card() {
+        let mut app = test_app("all-toggle-flag", &[], Mode::All, 0, true);
+
+        app.toggle_later();
+
+        assert!(app.revealed);
+        assert!(app.later.contains("a"));
+        let (card, _, _) = app.current().expect("card shown");
+        assert_eq!(card.id, "a");
+
+        app.toggle_later();
+
+        assert!(app.revealed);
+        assert!(!app.later.contains("a"));
+        let (card, _, _) = app.current().expect("card shown");
+        assert_eq!(card.id, "a");
     }
 }
 
