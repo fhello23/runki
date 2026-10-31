@@ -8,6 +8,7 @@ pub mod session;
 #[cfg(feature = "gui")]
 pub mod theme;
 pub mod tui;
+pub mod web;
 
 /// Runki's version, from `Cargo.toml` (the only place it is set).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

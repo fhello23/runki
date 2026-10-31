@@ -11,6 +11,13 @@ see. Releasing moves those lines under the new version (see
 
 ## [Unreleased]
 
+### Added
+
+- Optional LAN web study interface, toggled with **Web** on desktop or `w`
+  in the TUI, with remembered settings and `--web` / `--web-port` overrides.
+- Browser library and full study controls sharing the existing progress files;
+  no login, so anyone on the network can study and change progress.
+
 ## [0.3.5] - 2026-10-31
 
 ### Added

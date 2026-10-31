@@ -14,6 +14,7 @@
 //! save debounce, error banners, file pickers, and drag-and-drop.
 
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -25,6 +26,7 @@ use crate::library::{self, DeckEntry, DeckStatus, LibraryLoader};
 use crate::progress::{self, CardFilter, CardOrder, LoadOutcome};
 use crate::session::StudySession;
 use crate::theme::{self, Palette};
+use crate::web::{LibrarySlot, WebOptions, WebServer, WARNING};
 use crate::VERSION;
 
 /// How often a dirty state is written while studying.
@@ -53,6 +55,10 @@ pub enum Screen {
 }
 
 pub struct RunkiApp {
+    library_slot: LibrarySlot,
+    web: Option<WebServer>,
+    web_port: u16,
+    web_error: Option<String>,
     config: Config,
     config_path: Option<PathBuf>,
     theme: egui::ThemePreference,
@@ -84,7 +90,20 @@ impl RunkiApp {
     /// A CLI argument is the only thing that wins over it, by
     /// construction.
     pub fn new(config: Config, initial_deck: Option<PathBuf>) -> Self {
+        Self::new_with_web_options(config, initial_deck, WebOptions::default())
+    }
+
+    pub fn new_with_web_options(
+        config: Config,
+        initial_deck: Option<PathBuf>,
+        options: WebOptions,
+    ) -> Self {
+        let web_on = options.on.unwrap_or(config.web_on);
         let mut app = Self {
+            library_slot: Arc::new(RwLock::new(config.library.clone())),
+            web: None,
+            web_port: options.port.unwrap_or(config.web_port),
+            web_error: None,
             config,
             config_path: None,
             theme: egui::ThemePreference::System,
@@ -98,11 +117,33 @@ impl RunkiApp {
             error: None,
             save_error: None,
         };
+        if web_on {
+            app.start_web();
+        }
         app.rescan_library();
         if let Some(path) = initial_deck {
             app.open_path(path);
         }
         app
+    }
+
+    fn start_web(&mut self) {
+        match WebServer::start(Arc::clone(&self.library_slot), self.web_port) {
+            Ok(server) => {
+                self.web = Some(server);
+                self.web_error = None;
+            }
+            Err(err) => self.web_error = Some(format!("{err:#}")),
+        }
+    }
+
+    fn toggle_web(&mut self) {
+        if let Some(mut server) = self.web.take() {
+            self.web_error = server.stop().err().map(|err| format!("{err:#}"));
+        } else {
+            self.start_web();
+        }
+        self.config.web_on = self.web.is_some();
     }
 
     /// Start with this theme choice (as loaded from the app config).
@@ -298,6 +339,7 @@ impl RunkiApp {
     /// Point the library at `dir` and show it.
     fn set_library(&mut self, dir: PathBuf) {
         self.config.library = Some(dir);
+        *self.library_slot.write().expect("library slot") = self.config.library.clone();
         self.screen = Screen::Library;
         self.rescan_library();
     }
@@ -401,6 +443,11 @@ impl eframe::App for RunkiApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.save_now();
+        if let Some(mut server) = self.web.take() {
+            if let Err(err) = server.stop() {
+                eprintln!("runki: Web progress could not be saved: {err:#}");
+            }
+        }
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -638,6 +685,25 @@ impl RunkiApp {
                         });
                     });
                 });
+                ui.horizontal_wrapped(|ui| {
+                    if ui.selectable_label(self.web.is_some(), "Web").clicked() {
+                        self.toggle_web();
+                    }
+                    if let Some(server) = &self.web {
+                        ui.add(egui::Label::new(server.lan_url()).selectable(true));
+                        if ui.small_button("Copy URL").clicked() {
+                            ui.ctx().copy_text(server.lan_url().to_owned());
+                        }
+                        ui.label(
+                            egui::RichText::new(server.localhost_url())
+                                .small()
+                                .color(p.muted),
+                        );
+                    }
+                });
+                if self.web.is_some() {
+                    ui.label(egui::RichText::new(WARNING).small().color(p.muted));
+                }
                 if let Some(dir) = self.config.library.clone() {
                     ui.add(
                         egui::Label::new(
@@ -792,7 +858,7 @@ impl RunkiApp {
     }
 
     fn error_banners(&mut self, ui: &mut egui::Ui, p: &Palette, width: f32) {
-        for slot in [&mut self.error, &mut self.save_error] {
+        for slot in [&mut self.error, &mut self.save_error, &mut self.web_error] {
             let Some(error) = slot.clone() else { continue };
             ui.vertical_centered(|ui| {
                 ui.allocate_ui(egui::vec2(width, 0.0), |ui| {
@@ -1267,6 +1333,10 @@ mod tests {
             1_000,
         );
         let app = RunkiApp {
+            library_slot: Arc::new(RwLock::new(None)),
+            web: None,
+            web_port: 8765,
+            web_error: None,
             config: Config::default(),
             config_path: None,
             theme: egui::ThemePreference::System,
@@ -1732,5 +1802,60 @@ mod tests {
             app.library_error
         );
         assert!(app.library_entries.is_empty());
+    }
+
+    #[test]
+    fn web_overrides_toggle_persistence_and_library_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            web_on: true,
+            web_port: 4321,
+            ..Default::default()
+        };
+        let mut app = RunkiApp::new_with_web_options(
+            config.clone(),
+            None,
+            WebOptions {
+                on: Some(false),
+                port: Some(0),
+            },
+        );
+        assert!(app.web.is_none());
+        let mut storage = MemoryStorage::default();
+        eframe::App::save(&mut app, &mut storage);
+        assert_eq!(
+            eframe::get_value::<Config>(&storage, CONFIG_KEY),
+            Some(config)
+        );
+        app.set_library(dir.path().to_path_buf());
+        assert_eq!(*app.library_slot.read().unwrap(), app.config.library);
+        app.toggle_web();
+        assert!(app.web.is_some());
+        assert!(app.config.web_on);
+        assert_eq!(app.config.web_port, 4321);
+        let port = app.web.as_ref().unwrap().local_addr.port();
+        app.toggle_web();
+        assert!(app.web.is_none());
+        assert!(!app.config.web_on);
+        let _listener =
+            std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).unwrap();
+    }
+
+    #[test]
+    fn failed_web_start_leaves_toggle_off_and_reports_error() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let config = Config {
+            web_port: listener.local_addr().unwrap().port(),
+            ..Default::default()
+        };
+        let mut app = RunkiApp::new(config, None);
+        app.toggle_web();
+        assert!(app.web.is_none());
+        assert!(!app.config.web_on);
+        assert!(app
+            .web_error
+            .as_deref()
+            .unwrap()
+            .contains("Could not start Web"));
     }
 }
