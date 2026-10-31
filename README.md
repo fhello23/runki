@@ -68,7 +68,7 @@ checkout or straight from a release tag:
 
 ```sh
 cargo install --path . --locked
-cargo install --git https://github.com/fhello23/runki --tag v0.2.0 --locked
+cargo install --git https://github.com/fhello23/runki --tag v0.3.0 --locked
 ```
 
 ## Version
@@ -78,7 +78,7 @@ is shown on the library and start screens and in **Runki → About
 Runki** on macOS, and printed by:
 
 ```sh
-runki --version                # runki 0.2.0
+runki --version                # runki 0.3.0
 runki --help
 ```
 
