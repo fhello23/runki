@@ -740,7 +740,7 @@ impl RunkiApp {
                     ui.push_id(&entry.path, |ui| {
                         let ready = matches!(entry.status, DeckStatus::Ready { .. });
                         let row = ui.allocate_ui(egui::vec2(width, 0.0), |ui| {
-                            egui::Frame::new().fill(p.surface).stroke(egui::Stroke::new(1.0, p.line))
+                            egui::Frame::new().fill(p.surface).stroke(egui::Stroke::new(1.0_f32, p.line))
                                 .corner_radius(12).inner_margin(16).show(ui, |ui| {
                                     ui.set_width(ui.available_width());
                                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
@@ -777,7 +777,7 @@ impl RunkiApp {
                         });
                         if ready {
                             let response = row.response.interact(egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
-                            if response.hovered() { ui.painter().rect_stroke(response.rect, 12, egui::Stroke::new(1.0, p.accent), egui::StrokeKind::Inside); }
+                            if response.hovered() { ui.painter().rect_stroke(response.rect, 12, egui::Stroke::new(1.0_f32, p.accent), egui::StrokeKind::Inside); }
                             if response.clicked() { to_open = Some(entry.path.clone()); }
                         }
                     });
@@ -999,7 +999,7 @@ fn study_card(
     let shown = ui.allocate_ui(egui::vec2(width, 0.0), |ui| {
         egui::Frame::new()
             .fill(p.surface)
-            .stroke(egui::Stroke::new(1.0, p.line))
+            .stroke(egui::Stroke::new(1.0_f32, p.line))
             .corner_radius(16)
             .shadow(egui::Shadow {
                 offset: [0, 6],
@@ -1119,7 +1119,7 @@ fn theme_toggle(ui: &mut egui::Ui, p: &Palette, current: egui::ThemePreference) 
 fn keycap(ui: &mut egui::Ui, p: &Palette, key: &str) {
     egui::Frame::new()
         .fill(p.surface)
-        .stroke(egui::Stroke::new(1.0, p.line))
+        .stroke(egui::Stroke::new(1.0_f32, p.line))
         .corner_radius(5)
         .inner_margin(egui::Margin::symmetric(6, 1))
         .show(ui, |ui| {
@@ -1205,7 +1205,7 @@ fn drop_overlay(ctx: &egui::Context, p: &Palette, adding: bool) {
     painter.rect_stroke(
         screen.shrink(16.0),
         16,
-        egui::Stroke::new(2.0, p.accent),
+        egui::Stroke::new(2.0_f32, p.accent),
         egui::StrokeKind::Inside,
     );
     painter.text(
