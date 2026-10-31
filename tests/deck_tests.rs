@@ -41,7 +41,7 @@ fn later_list_roundtrips() {
     later.insert("abc".to_string());
     later.insert("123".to_string());
     save_later(&deck_path, &later).unwrap();
-    assert_eq!(load_later(&deck_path), later);
+    assert_eq!(load_later(&deck_path).unwrap(), later);
     assert!(dir.join("deck.tsv.later.json").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
