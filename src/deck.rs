@@ -110,12 +110,16 @@ fn load_apkg(path: &Path) -> Result<Vec<Card>> {
         )
     })?;
 
-    // rusqlite needs a real file, so park the database in a temp file.
-    let tmp = std::env::temp_dir().join(format!("runki-{}.anki2", std::process::id()));
-    std::fs::write(&tmp, &db_bytes)?;
-    let result = read_anki_db(&tmp);
-    let _ = std::fs::remove_file(&tmp);
-    result
+    // rusqlite needs a real file, so park the database in a temp file with
+    // an unpredictable name (no clobbering, no collisions between loads).
+    let mut tmp = tempfile::NamedTempFile::new()
+        .context("Could not create a temporary file for the Anki database")?;
+    tmp.write_all(&db_bytes)?;
+    tmp.flush()?;
+    // Close the handle (keeping the path) so SQLite can reopen it on
+    // all platforms; the file is deleted when `tmp_path` drops.
+    let tmp_path = tmp.into_temp_path();
+    read_anki_db(&tmp_path)
 }
 
 fn read_anki_db(db_path: &Path) -> Result<Vec<Card>> {
@@ -283,7 +287,10 @@ pub fn parse_delimited(bytes: &[u8], delimiter: u8) -> Result<Vec<Card>> {
 
 /// Path of the study-later sidecar file for a deck.
 pub fn later_path(deck_path: &Path) -> PathBuf {
-    PathBuf::from(format!("{}.later.json", deck_path.display()))
+    // Append to the OsString so non-UTF-8 paths are kept exactly.
+    let mut os = deck_path.as_os_str().to_owned();
+    os.push(".later.json");
+    PathBuf::from(os)
 }
 
 /// Load flagged card ids for a deck; empty set if none saved yet.
