@@ -48,6 +48,7 @@ tar -xzf runki-<version>-linux-x86_64.tar.gz
 cd runki-<version>-linux-x86_64
 ./runki                        # opens the library
 ./runki path/to/deck.apkg
+./runki --tui                  # use the terminal interface
 ```
 
 To run `runki` from any folder, move it onto your `PATH`, e.g.
@@ -61,6 +62,7 @@ With [Rust](https://rustup.rs) installed:
 cargo run --release            # opens the library
 cargo run --release -- path/to/deck.apkg
 cargo run --release -- sample-deck.tsv
+cargo run --release -- --tui   # opens the terminal library
 ```
 
 Or install it as a `runki` command (in `~/.cargo/bin`), either from a
@@ -70,6 +72,71 @@ checkout or straight from a release tag:
 cargo install --path . --locked
 cargo install --git https://github.com/fhello23/runki --tag v0.3.0 --locked
 ```
+
+## Terminal interface
+
+The same binary includes a full terminal interface for local terminals,
+SSH and tmux:
+
+```sh
+runki --tui
+runki --tui path/to/deck.apkg
+runki --tui --library ~/Decks
+```
+
+On macOS, the app bundle's executable supports the same options:
+
+```sh
+/Applications/Runki.app/Contents/MacOS/runki --tui
+```
+
+For a machine without a desktop, build or install without GUI dependencies:
+
+```sh
+cargo run --release --no-default-features -- --tui
+cargo install --path . --locked --no-default-features
+```
+
+That build opens the TUI by default; a normal build still opens the desktop
+app by default. `--library DIR` accepts an existing folder in either mode.
+Inside the TUI, `c` also lets you create a new library folder. Type or paste
+paths with spaces directly, use `~/` for your home folder, `Backspace` to
+edit, and `Ctrl+u` to clear the input. `Esc` cancels a dialog.
+
+| Key | Terminal action |
+| --- | --- |
+| `↑` / `↓` or `j` / `k`, `Enter` | Select and open a library deck |
+| `a`, `c`, `r` in the library | Copy a deck in, choose/create a folder, refresh |
+| `o` | Open any deck by path |
+| `Space` / `Enter` while studying | Reveal answer, then advance (wraps) |
+| `l` | Toggle study later |
+| `1`, `2`, `3` | Show all, unseen, study-later cards |
+| `d`, `s`, `r` while studying | Deck order, shuffled order, reshuffle |
+| `R` | Reset seen progress, with confirmation; keeps study-later flags |
+| `↑` / `↓` or `j` / `k`, `PageUp` / `PageDown`, `Home` / `End` | Scroll long cards; navigate library rows |
+| `b` | Save and return to the library |
+| `t` | Toggle light/dark terminal colours (remembered) |
+| `?`, `e` | Scrollable help, full error/status message |
+| `q` / `Ctrl+c` | Save and quit |
+
+All deck formats, filters, shuffle, resume, progress merging and cloud
+placeholder handling work as in the desktop app. Card text wraps to the
+terminal width. Help and messages scroll with arrow keys or PageUp/PageDown.
+An interactive terminal of at least 32 columns × 10 rows is needed;
+80 × 24 or larger is more comfortable. Redirected input/output is rejected.
+
+Progress saves every two seconds and before leaving a deck. If saving
+fails, the deck stays open so you can retry or explicitly discard the
+unsaved changes. Unreadable progress files remain untouched and are
+labelled read-only for that session.
+
+The two interfaces share their library folder and last-opened deck in a
+per-machine `runki/config.json` inside the OS config directory:
+`~/Library/Application Support` on macOS, `$XDG_CONFIG_HOME` (or
+`~/.config`) on Linux, and `%APPDATA%` on Windows. Existing desktop
+settings import automatically without altering the old settings file.
+Deck progress stays in the same library `.runki/` folder or sidecar
+described below, so switching interfaces resumes the same session.
 
 ## Version
 

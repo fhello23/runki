@@ -17,7 +17,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use serde::{Deserialize, Serialize};
+
+pub use crate::config::Config;
 
 use crate::deck::{self, Card};
 use crate::library::{self, DeckEntry, DeckStatus, LibraryLoader};
@@ -31,19 +32,6 @@ const SAVE_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Storage key for [`Config`] in eframe's persistent storage.
 pub const CONFIG_KEY: &str = "runki_config";
-
-/// Per-machine app config (not synced): which folder is the library
-/// and which deck was opened last. Stored via eframe persistence
-/// (loaded from `cc.storage` in `main`, saved in [`eframe::App::save`]).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Config {
-    /// The library folder, if one has been chosen.
-    #[serde(default)]
-    pub library: Option<PathBuf>,
-    /// The deck most recently opened, from anywhere.
-    #[serde(default)]
-    pub last_open_deck: Option<PathBuf>,
-}
 
 /// Reveal a not-downloaded deck in Finder (`open -R`), pointing at
 /// the real file if it exists and at its iCloud placeholder
@@ -66,6 +54,7 @@ pub enum Screen {
 
 pub struct RunkiApp {
     config: Config,
+    config_path: Option<PathBuf>,
     theme: egui::ThemePreference,
     screen: Screen,
     /// Rows from the latest library scan, with loader summaries
@@ -97,6 +86,7 @@ impl RunkiApp {
     pub fn new(config: Config, initial_deck: Option<PathBuf>) -> Self {
         let mut app = Self {
             config,
+            config_path: None,
             theme: egui::ThemePreference::System,
             screen: Screen::Library,
             library_entries: Vec::new(),
@@ -118,6 +108,12 @@ impl RunkiApp {
     /// Start with this theme choice (as loaded from the app config).
     pub fn with_theme(mut self, theme: egui::ThemePreference) -> Self {
         self.theme = theme;
+        self
+    }
+
+    /// Mirror library settings to the file also used by the TUI.
+    pub fn with_config_path(mut self, path: PathBuf) -> Self {
+        self.config_path = Some(path);
         self
     }
 
@@ -390,6 +386,11 @@ impl eframe::App for RunkiApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         self.save_now();
         eframe::set_value(storage, CONFIG_KEY, &self.config);
+        if let Some(path) = &self.config_path {
+            if let Err(err) = crate::config::save(path, &self.config) {
+                self.error = Some(format!("{err:#}"));
+            }
+        }
         theme::store(storage, self.theme);
     }
 
@@ -1267,6 +1268,7 @@ mod tests {
         );
         let app = RunkiApp {
             config: Config::default(),
+            config_path: None,
             theme: egui::ThemePreference::System,
             screen: Screen::Study,
             library_entries: Vec::new(),
@@ -1326,10 +1328,25 @@ mod tests {
     }
 
     #[test]
+    fn desktop_save_mirrors_settings_used_by_the_terminal() {
+        let (app, temp) = test_app("shared-config", &[]);
+        let path = temp.0.join("config.json");
+        let mut app = app.with_config_path(path.clone());
+        app.config.terminal_light = true;
+        let mut storage = MemoryStorage::default();
+        eframe::App::save(&mut app, &mut storage);
+        assert_eq!(
+            crate::config::load(&path).unwrap(),
+            Some(app.config.clone())
+        );
+    }
+
+    #[test]
     fn existing_config_without_a_theme_follows_the_system() {
         let config = Config {
             library: Some(PathBuf::from("existing-library")),
             last_open_deck: Some(PathBuf::from("existing-library/deck.tsv")),
+            ..Default::default()
         };
         let mut storage = MemoryStorage::default();
         eframe::set_value(&mut storage, CONFIG_KEY, &config);
@@ -1622,6 +1639,7 @@ mod tests {
         let config = Config {
             library: Some(library.clone()),
             last_open_deck: None,
+            ..Default::default()
         };
         // Opened by path (as a CLI deck would be), not via a row click.
         let mut app = RunkiApp::new(config, Some(deck_path.clone()));
@@ -1655,6 +1673,7 @@ mod tests {
         let config = Config {
             library: Some(library.clone()),
             last_open_deck: Some(deck_path.clone()),
+            ..Default::default()
         };
         // Even with a remembered deck, the start screen is the
         // library (only a CLI deck auto-opens), already scanned.
@@ -1701,6 +1720,7 @@ mod tests {
         let config = Config {
             library: Some(dir),
             last_open_deck: None,
+            ..Default::default()
         };
         let app = RunkiApp::new(config, None);
         assert_eq!(app.screen(), Screen::Library);
