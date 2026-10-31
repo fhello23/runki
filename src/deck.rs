@@ -239,19 +239,19 @@ fn reveal_cloze(input: &str) -> String {
     while let Some(start) = rest.find("{{c") {
         out.push_str(&rest[..start]);
         let after = &rest[start + 3..];
-        match after.find("::") {
-            Some(sep) => {
-                let content = &after[sep + 2..];
-                let end = content.find("}}").unwrap_or(content.len());
-                let body = &content[..end];
-                out.push_str(body.split("::").next().unwrap_or(body));
-                rest = &content[end + 2.min(content.len() - end)..];
-            }
-            None => {
-                out.push_str("{{c");
-                rest = after;
-            }
+        // Only `{{c<digits>::` is a cloze opener; other `{{c` text (e.g.
+        // `{{curly}}`) is emitted literally.
+        let digits = after.bytes().take_while(|b| b.is_ascii_digit()).count();
+        if digits == 0 || !after[digits..].starts_with("::") {
+            out.push_str("{{c");
+            rest = after;
+            continue;
         }
+        let content = &after[digits + 2..];
+        let end = content.find("}}").unwrap_or(content.len());
+        let body = &content[..end];
+        out.push_str(body.split("::").next().unwrap_or(body));
+        rest = &content[end + 2.min(content.len() - end)..];
     }
     out.push_str(rest);
     out
