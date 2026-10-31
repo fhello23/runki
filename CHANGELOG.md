@@ -11,6 +11,15 @@ see. Releasing moves those lines under the new version (see
 
 ## [Unreleased]
 
+### Added
+
+- A full terminal interface (`runki --tui`): library browsing, adding
+  decks, folder selection, every study control, scrollable cards,
+  light/dark themes and in-app help. Shares library settings and
+  progress with the desktop app; existing settings import automatically.
+- `--library DIR` to select a library from the command line, and
+  `--no-default-features` builds for terminal use without desktop dependencies.
+
 ## [0.3.0] - 2026-10-31
 
 ### Changed

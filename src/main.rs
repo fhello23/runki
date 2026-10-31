@@ -1,72 +1,151 @@
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "gui", target_os = "macos"))]
 mod about_macos;
 
-use runki::app::{Config, RunkiApp, CONFIG_KEY};
-use runki::{theme, VERSION};
+use runki::config;
+#[cfg(feature = "gui")]
+use runki::config::Config;
+use runki::VERSION;
 
 const USAGE: &str = "\
-Usage: runki [DECK]
+Usage: runki [OPTIONS] [DECK]
 
 Opens the library, or DECK (.apkg, .csv, .tsv, .txt) straight away.
+The desktop interface is the default; terminal-only builds use the TUI.
 
 Options:
-  -h, --help     Print this help
-  -V, --version  Print the version";
+  -t, --tui          Run the full terminal interface
+      --library DIR Use this library folder (remembered for both interfaces)
+  -h, --help         Print this help
+  -V, --version      Print the version
+      --            Treat remaining arguments as a deck path
 
-/// What the command line asks for.
+In the TUI, press ? for keys and q to save and quit.";
+
 #[derive(Debug, PartialEq)]
 enum Command {
-    Run(Option<PathBuf>),
+    Run {
+        tui: bool,
+        deck: Option<PathBuf>,
+        library: Option<PathBuf>,
+    },
     Version,
     Help,
 }
 
-/// Reads the arguments after the program name. The first one decides:
-/// a flag, or a deck path. Anything after it is ignored, as before.
-fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Command, String> {
-    let Some(first) = args.next() else {
-        return Ok(Command::Run(None));
-    };
-    match first.as_str() {
-        "-V" | "--version" => Ok(Command::Version),
-        "-h" | "--help" => Ok(Command::Help),
-        // Old macOS passes a process serial number to apps opened from
-        // Finder; it is not a deck.
-        psn if psn.starts_with("-psn_") => Ok(Command::Run(None)),
-        flag if flag.starts_with('-') && flag != "-" => Err(format!("unknown option {flag}")),
-        _ => Ok(Command::Run(Some(PathBuf::from(first)))),
+fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Command, String> {
+    let mut args = args;
+    let mut tui = !cfg!(feature = "gui");
+    let mut deck = None;
+    let mut library = None;
+    let mut positional = false;
+    while let Some(arg) = args.next() {
+        if !positional {
+            match arg.to_str() {
+                Some("-V" | "--version") => return Ok(Command::Version),
+                Some("-h" | "--help") => return Ok(Command::Help),
+                Some("-t" | "--tui") => {
+                    tui = true;
+                    continue;
+                }
+                Some("--library") => {
+                    if library.is_some() {
+                        return Err("--library was given twice".into());
+                    }
+                    let dir = args.next().ok_or("--library needs a folder path")?;
+                    if dir.is_empty() || dir.to_string_lossy().starts_with('-') {
+                        return Err(
+                            "--library needs a folder path (prefix a leading '-' with ./)".into(),
+                        );
+                    }
+                    library = Some(PathBuf::from(dir));
+                    continue;
+                }
+                Some("--") => {
+                    positional = true;
+                    continue;
+                }
+                Some(psn) if psn.starts_with("-psn_") => continue,
+                Some(flag) if flag.starts_with('-') && flag != "-" => {
+                    return Err(format!("unknown option {flag}"))
+                }
+                _ => {}
+            }
+        }
+        if deck.is_some() {
+            return Err("only one deck path can be opened at a time".into());
+        }
+        deck = Some(PathBuf::from(arg));
     }
+    Ok(Command::Run { tui, deck, library })
 }
 
 fn main() -> ExitCode {
-    let initial_deck = match parse_args(std::env::args().skip(1)) {
-        Ok(Command::Run(deck)) => deck,
-        Ok(Command::Version) => {
-            println!("runki {VERSION}");
-            return ExitCode::SUCCESS;
-        }
-        Ok(Command::Help) => {
-            println!("runki {VERSION}\n\n{USAGE}");
-            return ExitCode::SUCCESS;
-        }
+    let command = match parse_args(std::env::args_os().skip(1)) {
+        Ok(command) => command,
         Err(error) => {
             eprintln!("runki: {error}\n\n{USAGE}");
             return ExitCode::from(2);
         }
     };
-    match run(initial_deck) {
+    let (tui, deck, library) = match command {
+        Command::Run { tui, deck, library } => (tui, deck, library),
+        Command::Version => {
+            println!("runki {VERSION}");
+            return ExitCode::SUCCESS;
+        }
+        Command::Help => {
+            println!("runki {VERSION}\n\n{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+    };
+    match run(tui, deck, library) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("runki: {error}");
+            eprintln!("runki: {error:#}");
             ExitCode::FAILURE
         }
     }
 }
 
-fn run(initial_deck: Option<PathBuf>) -> eframe::Result<()> {
+fn run(tui: bool, deck: Option<PathBuf>, library: Option<PathBuf>) -> anyhow::Result<()> {
+    if let Some(dir) = &library {
+        anyhow::ensure!(
+            dir.is_dir(),
+            "Library folder {} does not exist or is not a directory",
+            dir.display()
+        );
+    }
+    let library = library.map(std::fs::canonicalize).transpose()?;
+    let path = config::file_path()?;
+    let shared_config = match config::load(&path)? {
+        Some(config) => Some(config),
+        None => config::load_legacy()?,
+    };
+    if tui {
+        let mut config = shared_config.unwrap_or_default();
+        if let Some(dir) = library {
+            config.library = Some(dir);
+        }
+        return runki::tui::run(config, path, deck);
+    }
+    #[cfg(feature = "gui")]
+    run_gui(deck, shared_config, library, path).map_err(|err| anyhow::anyhow!("{err}"))?;
+    Ok(())
+}
+
+#[cfg(feature = "gui")]
+fn run_gui(
+    initial_deck: Option<PathBuf>,
+    shared_config: Option<Config>,
+    library: Option<PathBuf>,
+    config_path: PathBuf,
+) -> eframe::Result<()> {
+    use runki::app::{RunkiApp, CONFIG_KEY};
+    use runki::theme;
     let viewport = eframe::egui::ViewportBuilder::default()
         .with_app_id("runki")
         .with_inner_size([900.0, 650.0])
@@ -95,12 +174,18 @@ fn run(initial_deck: Option<PathBuf>) -> eframe::Result<()> {
             cc.egui_ctx.set_theme(choice);
             // A CLI deck (initial_deck) wins over the saved config:
             // it alone opens straight into the study screen.
-            let config: Config = cc
-                .storage
-                .and_then(|storage| eframe::get_value(storage, CONFIG_KEY))
-                .unwrap_or_default();
+            let mut config: Config = shared_config.unwrap_or_else(|| {
+                cc.storage
+                    .and_then(|storage| eframe::get_value(storage, CONFIG_KEY))
+                    .unwrap_or_default()
+            });
+            if let Some(dir) = library {
+                config.library = Some(dir);
+            }
             Ok(Box::new(
-                RunkiApp::new(config, initial_deck).with_theme(choice),
+                RunkiApp::new(config, initial_deck)
+                    .with_theme(choice)
+                    .with_config_path(config_path),
             ))
         }),
     )
@@ -111,37 +196,66 @@ mod tests {
     use super::*;
 
     fn parse(args: &[&str]) -> Result<Command, String> {
-        parse_args(args.iter().map(|arg| arg.to_string()))
+        parse_args(args.iter().map(OsString::from))
     }
 
     #[test]
-    fn no_arguments_opens_the_library() {
-        assert_eq!(parse(&[]), Ok(Command::Run(None)));
+    fn defaults_and_finder_launch() {
+        let expected = Command::Run {
+            tui: !cfg!(feature = "gui"),
+            deck: None,
+            library: None,
+        };
+        assert_eq!(parse(&[]), Ok(expected));
+        assert_eq!(parse(&["-psn_0_12345"]), parse(&[]));
     }
 
     #[test]
-    fn a_path_opens_that_deck() {
+    fn paths_and_flags_work_in_either_order() {
+        let expected = Command::Run {
+            tui: true,
+            deck: Some("deck.apkg".into()),
+            library: Some("my decks".into()),
+        };
         assert_eq!(
-            parse(&["deck.apkg"]),
-            Ok(Command::Run(Some(PathBuf::from("deck.apkg"))))
+            parse(&["--tui", "--library", "my decks", "deck.apkg"]),
+            Ok(expected)
+        );
+        assert_eq!(
+            parse(&["deck.apkg", "--tui", "--library", "my decks"]),
+            parse(&["--tui", "--library", "my decks", "deck.apkg"])
+        );
+        assert!(
+            matches!(parse(&["--tui", "--", "-deck.tsv"]), Ok(Command::Run { deck: Some(p), .. }) if p == std::path::Path::new("-deck.tsv"))
         );
     }
 
     #[test]
-    fn version_and_help_flags() {
-        assert_eq!(parse(&["--version"]), Ok(Command::Version));
-        assert_eq!(parse(&["-V"]), Ok(Command::Version));
-        assert_eq!(parse(&["--help"]), Ok(Command::Help));
-        assert_eq!(parse(&["-h"]), Ok(Command::Help));
+    fn version_help_and_invalid_arguments() {
+        for arg in ["--version", "-V"] {
+            assert_eq!(parse(&[arg]), Ok(Command::Version));
+        }
+        for arg in ["--help", "-h"] {
+            assert_eq!(parse(&[arg]), Ok(Command::Help));
+        }
+        for args in [
+            &["--verbose"][..],
+            &["--library"],
+            &["a.tsv", "b.tsv"],
+            &["--library", "--tui"],
+            &["--library", "a", "--library", "b"],
+        ] {
+            assert!(parse(args).is_err(), "{args:?}");
+        }
     }
 
+    #[cfg(unix)]
     #[test]
-    fn finder_process_serial_number_is_ignored() {
-        assert_eq!(parse(&["-psn_0_12345"]), Ok(Command::Run(None)));
-    }
-
-    #[test]
-    fn unknown_flags_are_rejected() {
-        assert!(parse(&["--verbose"]).is_err());
+    fn accepts_non_utf8_paths() {
+        use std::os::unix::ffi::OsStringExt;
+        let path = OsString::from_vec(b"deck-\xff.tsv".to_vec());
+        assert!(
+            matches!(parse_args([OsString::from("--tui"), path.clone()].into_iter()), Ok(Command::Run { deck: Some(p), .. }) if p == path)
+        );
     }
 }

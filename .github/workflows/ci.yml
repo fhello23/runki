@@ -23,16 +23,22 @@ jobs:
       - run: cargo fmt --all -- --check
 
   check:
-    name: Clippy and test (${{ matrix.os }})
+    name: Clippy and test (${{ matrix.os }}, ${{ matrix.interface }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+        interface: [desktop-and-terminal, terminal-only]
+        include:
+          - interface: desktop-and-terminal
+            flags: ''
+          - interface: terminal-only
+            flags: --no-default-features
     steps:
       - uses: actions/checkout@v4
       - name: Install Linux dependencies
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.interface == 'desktop-and-terminal'
         run: |
           sudo apt-get update
           sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev pkg-config
@@ -40,5 +46,5 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --locked -- -D warnings
-      - run: cargo test --locked
+      - run: cargo clippy ${{ matrix.flags }} --all-targets --locked -- -D warnings
+      - run: cargo test ${{ matrix.flags }} --locked
