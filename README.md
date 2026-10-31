@@ -24,10 +24,12 @@ You can also drag a deck file onto the window.
 
 ## Deck formats
 
-- `.apkg` — real Anki decks (`collection.anki2` / `collection.anki21`).
+- `.apkg` — real Anki decks, including modern exports. The newest
+  collection found is used (`collection.anki21b`, then
+  `collection.anki21`, then `collection.anki2`); the zstd-compressed
+  `.anki21b` format from Anki 2.1.50+ is supported, so there is no need
+  to re-export with "Support older Anki versions".
   A note's first field is the front; the remaining fields form the back.
-  If a deck exported by a newer Anki will not open, re-export it with
-  "Support older Anki versions" enabled.
 - `.csv` / `.tsv` / `.txt` — one card per row: `front<separator>back`.
   Extra columns are appended to the back. A `front,back` header row is
   skipped.

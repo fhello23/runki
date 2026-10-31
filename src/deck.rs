@@ -1,9 +1,10 @@
 //! Deck loading (`.apkg`, CSV, TSV) and study-later persistence.
 //!
-//! An `.apkg` is a zip containing a SQLite database (`collection.anki2`
-//! or `collection.anki21`). Cards are read from the `cards`/`notes`
-//! tables: a note's first field is the front, the remaining fields are
-//! the back. HTML is stripped down to plain text.
+//! An `.apkg` is a zip containing a SQLite database
+//! (`collection.anki21b`, `collection.anki21`, or `collection.anki2`;
+//! the `.anki21b` variant is zstd-compressed). Cards are read from the
+//! `cards`/`notes` tables: a note's first field is the front, the
+//! remaining fields are the back. HTML is stripped down to plain text.
 
 use std::collections::HashSet;
 use std::io::Read;
@@ -70,20 +71,31 @@ fn load_apkg(path: &Path) -> Result<Vec<Card>> {
     let mut archive =
         zip::ZipArchive::new(file).context("Not a valid .apkg (zip) file")?;
 
+    // Newest first: modern Anki also ships a dummy `collection.anki2`
+    // holding a "requires a newer version" placeholder note, so it must
+    // only be used when nothing newer is present.
     let mut db_bytes = None;
-    for entry in ["collection.anki2", "collection.anki21"] {
+    for entry in [
+        "collection.anki21b",
+        "collection.anki21",
+        "collection.anki2",
+    ] {
         if let Ok(mut zipped) = archive.by_name(entry) {
             let mut buf = Vec::new();
             zipped.read_to_end(&mut buf)?;
-            db_bytes = Some(buf);
+            db_bytes = Some(if entry == "collection.anki21b" {
+                zstd::decode_all(&buf[..])
+                    .context("Could not decompress collection.anki21b inside this .apkg")?
+            } else {
+                buf
+            });
             break;
         }
     }
     let db_bytes = db_bytes.ok_or_else(|| {
         anyhow!(
-            "No collection.anki2/anki21 inside this .apkg. \
-             If it was exported by a newer Anki, re-export with \
-             'Support older Anki versions' enabled."
+            "No collection.anki21b, collection.anki21, or \
+             collection.anki2 inside this .apkg."
         )
     })?;
 
