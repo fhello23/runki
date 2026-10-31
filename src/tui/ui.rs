@@ -9,12 +9,14 @@ use crate::library::{self, DeckStatus};
 use crate::progress::{self, CardFilter, CardOrder};
 use crate::VERSION;
 
-/// Card and file text is untrusted terminal output. Preserve line breaks and
-/// tabs, but never send escape sequences or other terminal controls to stdout.
+/// Card and file text is untrusted terminal output. Expand tabs before layout:
+/// Ratatui treats a raw tab as one cell, but terminals move to a tab stop.
+/// Preserve line breaks and remove all other terminal control characters.
 fn safe(text: &str) -> String {
     text.chars()
         .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
-        .collect()
+        .collect::<String>()
+        .replace('\t', "    ")
 }
 
 pub(super) fn draw(frame: &mut Frame, app: &mut App) {
@@ -352,11 +354,35 @@ fn draw_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
 
 #[cfg(test)]
 mod tests {
+    use super::{Paragraph, Rect};
+
     #[test]
     fn removes_terminal_controls_from_untrusted_content() {
         assert_eq!(
             super::safe("hello\x1b[2J\r\x07\u{009b}world\n\tend"),
-            "hello[2Jworld\n\tend"
+            "hello[2Jworld\n    end"
         );
+    }
+
+    #[test]
+    fn tabbed_text_never_reaches_the_terminal_as_tab_controls() {
+        use ratatui::backend::CrosstermBackend;
+        use ratatui::{Terminal, TerminalOptions, Viewport};
+
+        let mut output = Vec::new();
+        {
+            let backend = CrosstermBackend::new(&mut output);
+            let options = TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 20, 2)),
+            };
+            let mut terminal = Terminal::with_options(backend, options).unwrap();
+            terminal
+                .draw(|frame| {
+                    frame.render_widget(Paragraph::new(super::safe("word\tmeaning")), frame.area());
+                })
+                .unwrap();
+        }
+        assert!(!output.contains(&b'\t'));
+        assert_eq!(super::safe("word\tmeaning"), "word    meaning");
     }
 }
