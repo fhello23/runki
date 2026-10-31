@@ -9,11 +9,14 @@
 //! repaint hook is a plain callback the app wires to
 //! `ctx.request_repaint()`.
 //!
-//! Phase 4 will add conflict-copy merging and not-downloaded
-//! (dataless) detection; [`DeckStatus::NotDownloaded`] already
-//! leaves room for the latter, but nothing produces it yet.
+//! Sync hardening for cloud folders lives here too: online-only
+//! (dataless / placeholder) decks are listed as
+//! [`DeckStatus::NotDownloaded`] and never read, and sync conflict
+//! copies of state files in `.runki/` are merged into the real
+//! state and removed by the background loader (see
+//! `merge_conflict_copies`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,8 +44,9 @@ pub enum DeckStatus {
     },
     /// The deck could not be loaded; the row stays listed, unclickable.
     Failed(String),
-    /// The file is an online-only placeholder (phase 4 detection).
-    /// Never read by the background loader.
+    /// The file is an online-only placeholder (macOS dataless, or
+    /// a legacy `.<name>.icloud` placeholder). Never read by the
+    /// background loader; the row is not clickable.
     NotDownloaded,
 }
 
@@ -76,28 +80,136 @@ fn is_hidden_or_sidecar(file_name: &str) -> bool {
         || lower.ends_with(".tmp")
 }
 
+/// Whether `path` is a dataless (online-only) placeholder: the file
+/// is listed in the folder but its contents are not on this Mac, so
+/// opening it would block on a download. On macOS this is the
+/// `SF_DATALESS` flag in the file's metadata; the check only stats
+/// the file (`metadata`), it never opens or reads it. Everywhere
+/// else (and for a missing/unreadable path) it is `false`.
+#[cfg(target_os = "macos")]
+pub fn is_dataless(path: &Path) -> bool {
+    use std::os::macos::fs::MetadataExt;
+    /// `SF_DATALESS` from `<sys/stat.h>`.
+    const SF_DATALESS: u32 = 0x4000_0000;
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.st_flags() & SF_DATALESS != 0)
+}
+
+/// Non-macOS fallback: this build cannot detect dataless files.
+#[cfg(not(target_os = "macos"))]
+pub fn is_dataless(_path: &Path) -> bool {
+    false
+}
+
+/// The real file name behind a legacy iCloud placeholder name:
+/// `.<name>.icloud` -> `<name>` (e.g. `.French.apkg.icloud` ->
+/// `French.apkg`). `None` if `file_name` is not such a placeholder.
+fn icloud_placeholder_real_name(file_name: &str) -> Option<String> {
+    let real_name = file_name.strip_prefix('.')?.strip_suffix(".icloud")?;
+    (!real_name.is_empty()).then(|| real_name.to_string())
+}
+
+/// Path of the legacy iCloud placeholder for a real deck path:
+/// `French.apkg` -> `.French.apkg.icloud`, in the same folder.
+pub fn icloud_placeholder_path(real_path: &Path) -> PathBuf {
+    let Some(file_name) = real_path.file_name().and_then(|name| name.to_str()) else {
+        return real_path.to_path_buf();
+    };
+    real_path.with_file_name(format!(".{file_name}.icloud"))
+}
+
+/// The path to reveal for a deck row (e.g. with `open -R` in
+/// Finder): the real file if it exists, otherwise its iCloud
+/// placeholder if that exists, otherwise the real path anyway.
+/// Only stats the paths; never opens them.
+pub fn reveal_path(real_path: &Path) -> PathBuf {
+    if real_path.exists() {
+        return real_path.to_path_buf();
+    }
+    let placeholder = icloud_placeholder_path(real_path);
+    if placeholder.exists() {
+        return placeholder;
+    }
+    real_path.to_path_buf()
+}
+
+/// Whether a deck must not be read because only a placeholder is
+/// present: it is dataless, or the real file is missing while its
+/// legacy iCloud placeholder exists.
+fn is_not_downloaded(path: &Path) -> bool {
+    is_dataless(path) || (!path.exists() && icloud_placeholder_path(path).exists())
+}
+
+/// Paths the background loader may read: every row except
+/// [`DeckStatus::NotDownloaded`] ones, which are never sent to it.
+pub fn loadable_paths(entries: &[DeckEntry]) -> Vec<PathBuf> {
+    entries
+        .iter()
+        .filter(|entry| entry.status != DeckStatus::NotDownloaded)
+        .map(|entry| entry.path.clone())
+        .collect()
+}
+
 /// List the decks directly in `dir`, sorted by last opened (newest
 /// first), then name (case-insensitive).
 ///
-/// Rows come back as [`DeckStatus::Loading`]; `opened_at` is read
-/// from each deck's (small) state file so the order is right at
-/// once. A state file that fails to load just gives `opened_at`
-/// 0 — it never fails the scan. A missing or unreadable folder is
-/// an `Err` with a message naming the folder.
+/// Rows come back as [`DeckStatus::Loading`] with `opened_at` 0:
+/// scan only lists and stats directory entries, it never opens a
+/// deck or a state file (either could be an online-only file whose
+/// read would block the caller — the UI thread — on a download).
+/// The background loader reads each deck's state and re-sorts the
+/// rows as `opened_at` arrives in its summaries. Placeholder decks
+/// (dataless, or a legacy `.<name>.icloud` file) come back as
+/// [`DeckStatus::NotDownloaded`] instead. A missing or unreadable
+/// folder is an `Err` with a message naming the folder.
 pub fn scan(dir: &Path) -> Result<Vec<DeckEntry>> {
     let read_dir = std::fs::read_dir(dir)
         .with_context(|| format!("Could not read library folder {}", dir.display()))?;
-    let mut entries = Vec::new();
+    let mut files = Vec::new();
     for entry in read_dir {
         let entry =
             entry.with_context(|| format!("Could not read library folder {}", dir.display()))?;
         let path = entry.path();
-        if !path.is_file() {
-            continue;
+        if std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
+            files.push(path);
         }
+    }
+    let file_names: HashSet<String> = files
+        .iter()
+        .filter_map(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+        })
+        .collect();
+
+    let mut entries = Vec::new();
+    for path in files {
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
+        // A legacy iCloud placeholder lists its real deck, unless
+        // the real file is also here (then it is listed below).
+        if let Some(real_name) = icloud_placeholder_real_name(file_name) {
+            let real_path = dir.join(&real_name);
+            if file_names.contains(real_name.as_str())
+                || is_hidden_or_sidecar(&real_name)
+                || !is_deck_path(&real_path)
+            {
+                continue;
+            }
+            let display_name = real_path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or(&real_name)
+                .to_string();
+            entries.push(DeckEntry {
+                path: real_path,
+                display_name,
+                status: DeckStatus::NotDownloaded,
+                opened_at: 0,
+            });
+            continue;
+        }
         if is_hidden_or_sidecar(file_name) || !is_deck_path(&path) {
             continue;
         }
@@ -106,13 +218,16 @@ pub fn scan(dir: &Path) -> Result<Vec<DeckEntry>> {
             .and_then(|stem| stem.to_str())
             .unwrap_or(file_name)
             .to_string();
-        let state_path = progress::state_path(&path, Some(dir));
-        let opened_at = progress::load(&path, &state_path).state().opened_at;
+        let status = if is_dataless(&path) {
+            DeckStatus::NotDownloaded
+        } else {
+            DeckStatus::Loading
+        };
         entries.push(DeckEntry {
             path,
             display_name,
-            status: DeckStatus::Loading,
-            opened_at,
+            status,
+            opened_at: 0,
         });
     }
     sort_entries(&mut entries);
@@ -301,6 +416,147 @@ fn carry_over_progress(library: &Path, source: &Path, target: &Path) -> Result<(
     Ok(())
 }
 
+/// Whether `text` is a Finder/iCloud copy number (`2`, `3`, …).
+/// Numbered copies start at 2; `1` and non-numbers never match.
+fn is_copy_number(text: &str) -> bool {
+    !text.is_empty()
+        && text.bytes().all(|byte| byte.is_ascii_digit())
+        && text.parse::<u64>().is_ok_and(|n| n >= 2)
+}
+
+/// If `file_name` (a file in `.runki/`) is a sync conflict copy of
+/// one of `deck_file_names`' state files, the deck file name it
+/// copies. Recognized shapes, for a deck `French.apkg` whose state
+/// file is `French.apkg.json`:
+///
+/// - Dropbox: `French.apkg (<anything> conflicted copy<anything>).json`
+/// - numbered: `French.apkg 2.json`, `French.apkg 3.json`, …
+/// - numbered after the state extension: `French.apkg.json 2`, …
+///
+/// A file that is exactly some deck's state-file name is never a
+/// copy (a deck really called `French 2.apkg` owns
+/// `French 2.apkg.json`). Deck names are tried longest first, so a
+/// longer deck name that is a prefix of a copy's name wins over a
+/// shorter one.
+fn conflict_copy_deck<'a>(file_name: &str, deck_file_names: &'a [String]) -> Option<&'a str> {
+    if deck_file_names
+        .iter()
+        .any(|deck| file_name == format!("{deck}.json"))
+    {
+        return None;
+    }
+    let mut decks: Vec<&str> = deck_file_names.iter().map(String::as_str).collect();
+    decks.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    decks.into_iter().find(|deck| {
+        // Dropbox: `<deck> (<anything> conflicted copy<anything>).json`
+        if let Some(middle) = file_name
+            .strip_prefix(&format!("{deck} ("))
+            .and_then(|rest| rest.strip_suffix(").json"))
+        {
+            if middle.to_lowercase().contains("conflicted copy") {
+                return true;
+            }
+        }
+        // Numbered: `<deck> 2.json`, `<deck> 3.json`, …
+        if let Some(number) = file_name
+            .strip_prefix(&format!("{deck} "))
+            .and_then(|rest| rest.strip_suffix(".json"))
+        {
+            if is_copy_number(number) {
+                return true;
+            }
+        }
+        // Numbered after the extension: `<deck>.json 2`, …
+        if let Some(number) = file_name.strip_prefix(&format!("{deck}.json ")) {
+            if is_copy_number(number) {
+                return true;
+            }
+        }
+        false
+    })
+}
+
+/// Conflict copies in `runki_dir`, as `(copy path, deck file name)`
+/// pairs sorted by path for determinism. A missing `.runki/`
+/// folder simply has none.
+fn find_conflict_copies(runki_dir: &Path, deck_file_names: &[String]) -> Vec<(PathBuf, String)> {
+    let Ok(read_dir) = std::fs::read_dir(runki_dir) else {
+        return Vec::new();
+    };
+    let mut copies = Vec::new();
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        if !std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if let Some(deck) = conflict_copy_deck(file_name, deck_file_names) {
+            copies.push((path, deck.to_string()));
+        }
+    }
+    copies.sort();
+    copies
+}
+
+/// Merge every sync conflict copy in `<library>/.runki/` for the
+/// decks in `library` into its deck's state, then delete the copy.
+/// Runs in the background loader before summarizing, so it never
+/// blocks the UI. The deck list comes from a fresh (stat-only)
+/// [`scan`] of the library, so copies are matched against the
+/// actual deck file names present — including not-downloaded
+/// decks, whose real state files the exact-name guard must
+/// protect even though they are never summarized.
+///
+/// A copy is left on disk untouched when it is dataless, does not
+/// parse (including a newer state version), its deck's state is
+/// dataless or blocked, or saving the merged state fails: the copy
+/// may be the only record of another machine's progress, so it is
+/// only deleted after a successful save.
+fn merge_conflict_copies(library: &Path) {
+    let Ok(entries) = scan(library) else {
+        return;
+    };
+    let deck_paths: Vec<PathBuf> = entries.into_iter().map(|entry| entry.path).collect();
+    let mut decks: HashMap<String, PathBuf> = HashMap::new();
+    for deck_path in &deck_paths {
+        if let Some(file_name) = deck_path.file_name().and_then(|name| name.to_str()) {
+            decks
+                .entry(file_name.to_string())
+                .or_insert_with(|| deck_path.clone());
+        }
+    }
+    let deck_file_names: Vec<String> = decks.keys().cloned().collect();
+    let runki_dir = library.join(".runki");
+    for (copy_path, deck_file_name) in find_conflict_copies(&runki_dir, &deck_file_names) {
+        if is_dataless(&copy_path) {
+            continue;
+        }
+        let Some(deck_path) = decks.get(&deck_file_name) else {
+            continue;
+        };
+        let state_path = progress::state_path(deck_path, Some(library));
+        if is_dataless(&state_path) {
+            continue;
+        }
+        let Ok(Some(copy_state)) = progress::read_state_file(&copy_path) else {
+            continue; // Unparseable, newer, or vanished: leave it alone.
+        };
+        let outcome = progress::load(deck_path, &state_path);
+        if outcome.is_blocked() {
+            continue;
+        }
+        let merged = outcome.state().merge(&copy_state);
+        if progress::save(&state_path, &merged).is_ok() {
+            // Only now is the copy's progress safely in the real
+            // state file. A failed delete is fine: re-merging the
+            // copy next scan is idempotent.
+            let _ = std::fs::remove_file(&copy_path);
+        }
+    }
+}
+
 /// One background-loader result: a deck's counts and last-opened
 /// time, tagged with the generation that requested it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -325,12 +581,16 @@ type ParseCache = Arc<Mutex<HashMap<CacheKey, std::result::Result<Vec<String>, S
 
 /// Background loader for library rows.
 ///
-/// [`start`](Self::start) spawns a worker thread that runs
-/// `deck::load_deck` + `progress::load` (read-only, never saves)
-/// for each deck and sends a [`DeckSummary`] back over a channel,
-/// calling the repaint callback after each one. Each `start` bumps
-/// a generation counter: workers from older generations stop early
-/// and [`drain`](Self::drain) drops their results.
+/// [`start`](Self::start) spawns a worker thread that first merges
+/// any sync conflict copies for these decks (`merge_conflict_copies`,
+/// the loader's only write), then runs `deck::load_deck` +
+/// `progress::load` for each deck and sends a [`DeckSummary`] back
+/// over a channel, calling the repaint callback after each one.
+/// Each `start` bumps a generation counter: workers from older
+/// generations stop early and [`drain`](Self::drain) drops their
+/// results. Placeholder decks are never parsed: a dataless or
+/// placeholder-backed path summarizes as
+/// [`DeckStatus::NotDownloaded`] without being read.
 pub struct LibraryLoader {
     receiver: mpsc::Receiver<DeckSummary>,
     sender: mpsc::Sender<DeckSummary>,
@@ -376,6 +636,10 @@ impl LibraryLoader {
         let cache = Arc::clone(&self.cache);
         let parser = Arc::clone(&self.parser);
         std::thread::spawn(move || {
+            // Once per scan, before any deck's state is read for a
+            // summary: fold sync conflict copies into the real
+            // state files (and remove the copies).
+            merge_conflict_copies(&library);
             for path in &paths {
                 if current.load(Ordering::SeqCst) != generation {
                     return; // Superseded by a newer scan.
@@ -410,7 +674,14 @@ impl LibraryLoader {
 }
 
 /// Load one deck (or reuse its cached parse) plus its fresh state,
-/// and fold them into a summary. Read-only: never saves.
+/// and fold them into a summary. Never saves (conflict-copy
+/// merging, the loader's only write, happens before summarizing).
+///
+/// A placeholder deck is reported [`DeckStatus::NotDownloaded`]
+/// without being opened. A dataless state file is likewise skipped
+/// — reading it would block on a download — and its progress is
+/// treated as unknown (zero counts, `opened_at` 0); the deck itself
+/// is still parsed for its total.
 fn summarize(
     library: &Path,
     path: &Path,
@@ -418,9 +689,20 @@ fn summarize(
     cache: &ParseCache,
     parser: &Parser,
 ) -> DeckSummary {
+    if is_not_downloaded(path) {
+        return DeckSummary {
+            generation,
+            path: path.to_path_buf(),
+            status: DeckStatus::NotDownloaded,
+            opened_at: 0,
+        };
+    }
     let state_path = progress::state_path(path, Some(library));
-    let outcome = progress::load(path, &state_path);
-    let state = outcome.state();
+    let state = if is_dataless(&state_path) {
+        progress::DeckState::new()
+    } else {
+        progress::load(path, &state_path).into_state()
+    };
     let opened_at = state.opened_at;
 
     let metadata = std::fs::metadata(path);
@@ -571,15 +853,41 @@ mod tests {
     }
 
     #[test]
-    fn scan_sorts_by_opened_at_then_name() {
-        let (dir, _temp) = temp_dir("scan-sorting");
+    fn scan_does_not_read_state_files() {
+        let (dir, _temp) = temp_dir("scan-no-state-read");
         for name in ["banana.csv", "Apple.csv", "cherry.csv", "Dates.csv"] {
             write(&dir.join(name), "Q,A\n");
         }
         seed_state(&dir, "cherry.csv", |state| state.opened_at = 200);
         seed_state(&dir, "banana.csv", |state| state.opened_at = 100);
 
+        // Scan only lists and stats entries (a state file could be a
+        // cloud placeholder whose read would block), so every row
+        // starts at opened_at 0 in name order; the loader's
+        // summaries supply opened_at and trigger the re-sort.
         let entries = scan(&dir).expect("scan");
+        assert_eq!(names(&entries), ["Apple", "banana", "cherry", "Dates"]);
+        assert!(
+            entries.iter().all(|entry| entry.opened_at == 0),
+            "scan must not read state files: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn sort_entries_orders_by_opened_at_then_name() {
+        let entry = |name: &str, opened_at: i64| DeckEntry {
+            path: PathBuf::from(format!("{name}.csv")),
+            display_name: name.to_string(),
+            status: DeckStatus::Loading,
+            opened_at,
+        };
+        let mut entries = vec![
+            entry("banana", 100),
+            entry("Apple", 0),
+            entry("cherry", 200),
+            entry("Dates", 0),
+        ];
+        sort_entries(&mut entries);
         assert_eq!(names(&entries), ["cherry", "banana", "Apple", "Dates"]);
         assert_eq!(entries[0].opened_at, 200);
         assert_eq!(entries[2].opened_at, 0);
@@ -597,6 +905,289 @@ mod tests {
         let entries = scan(&dir).expect("scan does not fail on bad state");
         assert_eq!(names(&entries), ["deck"]);
         assert_eq!(entries[0].opened_at, 0, "bad state reads as never opened");
+    }
+
+    fn write_state(path: &Path, state: &DeckState) {
+        write(
+            path,
+            &serde_json::to_string(state).expect("serialize state"),
+        );
+    }
+
+    #[test]
+    fn dataless_check_is_false_for_local_and_missing_files() {
+        // The SF_DATALESS flag itself cannot be created in a test;
+        // only the negative cases and the name/path logic around it
+        // are testable.
+        let (dir, _temp) = temp_dir("dataless-negative");
+        let local = dir.join("deck.csv");
+        write(&local, "Q,A\n");
+        assert!(!is_dataless(&local));
+        assert!(!is_dataless(&dir.join("missing.csv")));
+    }
+
+    #[test]
+    fn icloud_placeholder_name_and_path_logic() {
+        assert_eq!(
+            icloud_placeholder_real_name(".French.apkg.icloud").as_deref(),
+            Some("French.apkg")
+        );
+        assert_eq!(
+            icloud_placeholder_real_name(".my deck.csv.icloud").as_deref(),
+            Some("my deck.csv")
+        );
+        assert_eq!(icloud_placeholder_real_name("French.apkg"), None);
+        assert_eq!(icloud_placeholder_real_name("French.apkg.icloud"), None);
+        assert_eq!(icloud_placeholder_real_name(".hidden.csv"), None);
+        assert_eq!(icloud_placeholder_real_name(".icloud"), None);
+
+        let real = Path::new("/lib/French.apkg");
+        assert_eq!(
+            icloud_placeholder_path(real),
+            PathBuf::from("/lib/.French.apkg.icloud")
+        );
+    }
+
+    #[test]
+    fn reveal_path_prefers_real_file_then_placeholder() {
+        let (dir, _temp) = temp_dir("reveal-path");
+        let real = dir.join("French.apkg");
+        let placeholder = dir.join(".French.apkg.icloud");
+        assert_eq!(reveal_path(&real), real, "neither exists: real path");
+
+        write(&placeholder, "placeholder");
+        assert_eq!(reveal_path(&real), placeholder);
+
+        write(&real, "deck");
+        assert_eq!(reveal_path(&real), real);
+    }
+
+    #[test]
+    fn scan_lists_icloud_placeholder_as_not_downloaded() {
+        let (dir, _temp) = temp_dir("scan-icloud-placeholder");
+        write(&dir.join(".French.apkg.icloud"), "placeholder");
+        write(&dir.join(".German.csv.icloud"), "placeholder");
+        // Placeholders for non-decks and hidden decks stay unlisted.
+        write(&dir.join(".notes.md.icloud"), "placeholder");
+        write(&dir.join("..hidden.csv.icloud"), "placeholder");
+        write(&dir.join("Spanish.csv"), "Q,A\n");
+
+        let entries = scan(&dir).expect("scan");
+        assert_eq!(names(&entries), ["French", "German", "Spanish"]);
+        let french = &entries[0];
+        assert_eq!(french.path, dir.join("French.apkg"));
+        assert_eq!(french.status, DeckStatus::NotDownloaded);
+        assert_eq!(french.opened_at, 0);
+        assert_eq!(entries[1].status, DeckStatus::NotDownloaded);
+        assert_eq!(entries[2].status, DeckStatus::Loading);
+    }
+
+    #[test]
+    fn scan_lists_real_file_only_when_placeholder_also_exists() {
+        let (dir, _temp) = temp_dir("scan-icloud-real-wins");
+        write(&dir.join("French.apkg"), "deck");
+        write(&dir.join(".French.apkg.icloud"), "placeholder");
+
+        let entries = scan(&dir).expect("scan");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, dir.join("French.apkg"));
+        assert_eq!(entries[0].status, DeckStatus::Loading);
+    }
+
+    #[test]
+    fn not_downloaded_rows_are_not_sent_to_the_loader() {
+        let (dir, _temp) = temp_dir("not-downloaded-not-loaded");
+        write(&dir.join(".French.apkg.icloud"), "placeholder");
+        write(&dir.join("Spanish.csv"), "Q,A\n");
+
+        let entries = scan(&dir).expect("scan");
+        assert_eq!(loadable_paths(&entries), [dir.join("Spanish.csv")]);
+    }
+
+    #[test]
+    fn conflict_copy_name_matching() {
+        let decks: Vec<String> = ["French.apkg", "French 2.apkg", "German.csv"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let owner = |name: &str| conflict_copy_deck(name, &decks);
+
+        // Dropbox pattern.
+        assert_eq!(
+            owner("French.apkg (Francisco's MacBook conflicted copy 2026-10-31).json"),
+            Some("French.apkg")
+        );
+        assert_eq!(
+            owner("French.apkg (conflicted copy).json"),
+            Some("French.apkg")
+        );
+        // Numbered copies.
+        assert_eq!(owner("French.apkg 2.json"), Some("French.apkg"));
+        assert_eq!(owner("French.apkg 3.json"), Some("French.apkg"));
+        assert_eq!(owner("French.apkg.json 2"), Some("French.apkg"));
+        // Copies of the longer deck name belong to that deck.
+        assert_eq!(owner("French 2.apkg 2.json"), Some("French 2.apkg"));
+        assert_eq!(
+            owner("French 2.apkg (Other Mac conflicted copy).json"),
+            Some("French 2.apkg")
+        );
+
+        // Exact state-file names are never copies, including the
+        // deck really called "French 2.apkg".
+        assert_eq!(owner("French.apkg.json"), None);
+        assert_eq!(owner("French 2.apkg.json"), None);
+        assert_eq!(owner("German.csv.json"), None);
+        // Unrelated or malformed names never match.
+        assert_eq!(owner("Unrelated.apkg 2.json"), None);
+        assert_eq!(owner("Unrelated.apkg (x conflicted copy).json"), None);
+        assert_eq!(owner("French.apkg (just a copy).json"), None);
+        assert_eq!(owner("French.apkg (conflicted).json"), None);
+        assert_eq!(owner("French.apkg 1.json"), None);
+        assert_eq!(owner("French.apkg x.json"), None);
+        assert_eq!(owner("French.apkg 2.txt"), None);
+        assert_eq!(owner("French.apkg.json"), None);
+        assert_eq!(owner("random.json"), None);
+        assert_eq!(owner(".French.apkg.json.123.tmp"), None);
+    }
+
+    #[test]
+    fn conflict_copy_matching_uses_longest_deck_name() {
+        // "Data.csv 2.csv" is itself a deck whose name extends
+        // "Data.csv"-copy-looking prefixes; its copies must not be
+        // claimed by the shorter deck, and its own state file must
+        // never be treated as a copy at all.
+        let decks: Vec<String> = ["Data.csv", "Data.csv 2.csv"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let owner = |name: &str| conflict_copy_deck(name, &decks);
+        assert_eq!(owner("Data.csv 2.csv.json"), None, "exact state file");
+        assert_eq!(
+            owner("Data.csv 2.csv 2.json"),
+            Some("Data.csv 2.csv"),
+            "copy of the longer deck"
+        );
+        assert_eq!(
+            owner("Data.csv 2.csv (x conflicted copy).json"),
+            Some("Data.csv 2.csv")
+        );
+        assert_eq!(owner("Data.csv 2.json"), Some("Data.csv"));
+        assert_eq!(owner("Data.csv (x conflicted copy).json"), Some("Data.csv"));
+    }
+
+    #[test]
+    fn conflict_copy_is_merged_then_deleted() {
+        let (dir, _temp) = temp_dir("conflict-merge");
+        let deck_path = dir.join("French.csv");
+        write(&deck_path, "Q1,A1\nQ2,A2\nQ3,A3\n");
+        let deck = deck::load_deck(&deck_path).expect("parse deck");
+        let (id1, id2, id3) = (
+            deck.cards[0].id.as_str(),
+            deck.cards[1].id.as_str(),
+            deck.cards[2].id.as_str(),
+        );
+
+        // This Mac's state.
+        seed_state(&dir, "French.csv", |state| {
+            state.set_later(id1, true, 10);
+            state.mark_seen(id1, 10);
+            state.mark_opened(100);
+        });
+        // Another Mac's progress, left as a Dropbox conflict copy…
+        let runki = dir.join(".runki");
+        let dropbox_copy = runki.join("French.csv (Other Mac conflicted copy 2026-10-31).json");
+        let mut other = DeckState::new();
+        other.set_later(id2, true, 20);
+        other.mark_seen(id2, 20);
+        other.mark_opened(200);
+        write_state(&dropbox_copy, &other);
+        // …and a third Mac's, left as a numbered copy.
+        let numbered_copy = runki.join("French.csv 2.json");
+        let mut third = DeckState::new();
+        third.set_later(id3, true, 30);
+        third.mark_seen(id3, 30);
+        write_state(&numbered_copy, &third);
+
+        merge_conflict_copies(&dir);
+
+        assert!(!dropbox_copy.exists(), "merged Dropbox copy removed");
+        assert!(!numbered_copy.exists(), "merged numbered copy removed");
+        let state_path = progress::state_path(&deck_path, Some(&dir));
+        let merged = progress::load(&deck_path, &state_path).into_state();
+        for id in [id1, id2, id3] {
+            assert!(merged.is_later(id), "flag for {id} survived the merge");
+            assert!(merged.is_seen(id), "seen mark for {id} survived");
+        }
+        assert_eq!(merged.opened_at, 200);
+    }
+
+    #[test]
+    fn unparseable_and_newer_conflict_copies_are_left_in_place() {
+        let (dir, _temp) = temp_dir("conflict-unparseable");
+        let deck_path = dir.join("French.csv");
+        write(&deck_path, "Q1,A1\n");
+        let runki = dir.join(".runki");
+        let garbage = runki.join("French.csv (x conflicted copy).json");
+        write(&garbage, "not valid json {{{");
+        let newer = runki.join("French.csv 2.json");
+        write(&newer, "{\"version\": 999}");
+
+        merge_conflict_copies(&dir);
+
+        assert_eq!(
+            std::fs::read_to_string(&garbage).expect("garbage copy kept"),
+            "not valid json {{{"
+        );
+        assert!(newer.exists(), "newer-version copy kept");
+        assert!(
+            !progress::state_path(&deck_path, Some(&dir)).exists(),
+            "no state file invented from an unreadable copy"
+        );
+    }
+
+    #[test]
+    fn conflict_copy_is_kept_when_the_target_state_is_blocked() {
+        let (dir, _temp) = temp_dir("conflict-blocked-target");
+        let deck_path = dir.join("French.csv");
+        write(&deck_path, "Q1,A1\n");
+        // Block the real state path with a directory: the state
+        // cannot be read or written there.
+        let state_path = progress::state_path(&deck_path, Some(&dir));
+        std::fs::create_dir_all(&state_path).expect("blocking dir");
+        let copy = dir.join(".runki").join("French.csv 2.json");
+        let mut other = DeckState::new();
+        other.mark_opened(200);
+        write_state(&copy, &other);
+
+        merge_conflict_copies(&dir);
+
+        assert!(copy.exists(), "copy kept when its progress cannot be saved");
+        assert!(state_path.is_dir(), "blocked target untouched");
+    }
+
+    #[test]
+    fn merge_conflict_copies_never_touches_a_real_decks_state() {
+        let (dir, _temp) = temp_dir("conflict-real-deck-2");
+        let french = dir.join("French.csv");
+        write(&french, "Q1,A1\n");
+        let french2 = dir.join("French 2.csv");
+        write(&french2, "Q2,A2\n");
+        // The real state of the deck called "French 2.csv".
+        seed_state(&dir, "French 2.csv", |state| state.mark_opened(555));
+        let french2_state = progress::state_path(&french2, Some(&dir));
+        let before = std::fs::read_to_string(&french2_state).expect("state seeded");
+
+        merge_conflict_copies(&dir);
+
+        assert_eq!(
+            std::fs::read_to_string(&french2_state).expect("state still there"),
+            before,
+            "a real deck's state file is not treated as a conflict copy"
+        );
+        assert!(
+            !progress::state_path(&french, Some(&dir)).exists(),
+            "nothing was merged into the other deck either"
+        );
     }
 
     #[test]
@@ -810,6 +1401,84 @@ mod tests {
             "broken deck stays listed with its error: {:?}",
             broken_summary.status
         );
+    }
+
+    #[test]
+    fn opened_at_arrives_via_the_loader_not_scan() {
+        let (dir, _temp) = temp_dir("opened-via-loader");
+        let deck_path = dir.join("deck.csv");
+        write(&deck_path, "Q1,A1\n");
+        seed_state(&dir, "deck.csv", |state| state.mark_opened(4242));
+
+        let entries = scan(&dir).expect("scan");
+        assert_eq!(entries[0].opened_at, 0, "scan reads no state file");
+
+        let loader = no_op_loader();
+        loader.start(&dir, loadable_paths(&entries));
+        let summaries = collect(&loader, 1);
+        assert_eq!(summaries[0].opened_at, 4242);
+    }
+
+    #[test]
+    fn loader_never_parses_a_not_downloaded_deck() {
+        let (dir, _temp) = temp_dir("loader-not-downloaded");
+        write(&dir.join(".French.csv.icloud"), "placeholder");
+        let real_path = dir.join("French.csv");
+
+        let parses = Arc::new(AtomicUsize::new(0));
+        let counting = Arc::clone(&parses);
+        let loader = LibraryLoader::with_parser(
+            Box::new(|| {}),
+            Arc::new(move |path: &Path| {
+                counting.fetch_add(1, Ordering::SeqCst);
+                deck::load_deck(path)
+            }),
+        );
+        loader.start(&dir, vec![real_path.clone()]);
+        let summaries = collect(&loader, 1);
+        assert_eq!(summaries[0].path, real_path);
+        assert_eq!(summaries[0].status, DeckStatus::NotDownloaded);
+        assert_eq!(summaries[0].opened_at, 0);
+        assert_eq!(
+            parses.load(Ordering::SeqCst),
+            0,
+            "a placeholder deck is never opened"
+        );
+    }
+
+    #[test]
+    fn loader_merges_conflict_copies_before_summarizing() {
+        let (dir, _temp) = temp_dir("loader-conflict-merge");
+        let deck_path = dir.join("French.csv");
+        write(&deck_path, "Q1,A1\nQ2,A2\n");
+        let deck = deck::load_deck(&deck_path).expect("parse deck");
+        seed_state(&dir, "French.csv", |state| {
+            state.mark_seen(&deck.cards[0].id, 10);
+        });
+        let copy = dir
+            .join(".runki")
+            .join("French.csv (Other Mac conflicted copy).json");
+        let mut other = DeckState::new();
+        other.mark_seen(&deck.cards[1].id, 20);
+        other.set_later(&deck.cards[1].id, true, 20);
+        other.mark_opened(777);
+        write_state(&copy, &other);
+
+        let loader = no_op_loader();
+        loader.start(&dir, vec![deck_path.clone()]);
+        let summaries = collect(&loader, 1);
+
+        assert!(!copy.exists(), "loader merged and removed the copy");
+        assert_eq!(
+            summaries[0].status,
+            DeckStatus::Ready {
+                total: 2,
+                seen: 2,
+                later: 1
+            },
+            "summary counts include the merged copy's progress"
+        );
+        assert_eq!(summaries[0].opened_at, 777);
     }
 
     #[test]

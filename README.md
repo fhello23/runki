@@ -95,6 +95,24 @@ file and left in place. Editing a CSV row or renaming a deck file
 loses that card's / deck's progress, because progress is keyed by
 card id and deck file name.
 
+## Syncing between Macs
+
+Put the library folder in Dropbox or iCloud Drive and both the
+decks and the progress in its `.runki/` folder come along. Syncing
+is designed to be safe:
+
+- Study-later flags and seen marks merge per card when progress is
+  saved, so two Macs do not lose each other's flags or seen marks.
+  If the sync service left a conflict copy of a progress file in
+  `.runki/` (e.g. `French.apkg (… conflicted copy …).json`),
+  Runki merges it into that deck's progress and removes the copy.
+- A deck that is not downloaded on this Mac yet (online-only)
+  shows greyed as "Not downloaded" with a **Show in Finder**
+  button. Runki never reads it — opening it would block on the
+  download — so download it in Finder first, then **Refresh**.
+- Two Macs studying the same deck at the same moment is fine, but
+  each keeps its own current card until the deck is reopened.
+
 ## Limitations (by design, it is a plain viewer)
 
 - Card HTML is shown as plain text; images appear as `[image]` and
