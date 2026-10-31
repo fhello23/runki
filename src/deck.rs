@@ -286,13 +286,29 @@ fn strip_tags(input: &str) -> String {
             out.push(ch);
             continue;
         }
+        let is_tag_start = matches!(
+            chars.peek(),
+            Some(c) if c.is_ascii_alphabetic() || *c == '/' || *c == '!'
+        );
+        if !is_tag_start {
+            out.push('<');
+            continue;
+        }
         let mut tag = String::new();
+        let mut closed = false;
         for tc in chars.by_ref() {
             if tc == '>' {
+                closed = true;
                 break;
             }
-            tag.push(tc.to_ascii_lowercase());
+            tag.push(tc);
         }
+        if !closed {
+            out.push('<');
+            out.push_str(&tag);
+            break;
+        }
+        let tag = tag.to_ascii_lowercase();
         let name = tag
             .trim_start_matches('/')
             .split_whitespace()
