@@ -266,33 +266,6 @@ pub fn last_opened_label(opened_at: i64, now: i64) -> String {
     }
 }
 
-/// Library-folder shortcuts for first launch: `…/Dropbox/Runki` and
-/// `…/CloudDocs/Runki` under the home folder, offered only when
-/// their parent exists (choosing one creates the `Runki` folder).
-pub fn suggested_library_folders() -> Vec<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| suggested_library_folders_in(&home))
-        .unwrap_or_default()
-}
-
-fn suggested_library_folders_in(home: &Path) -> Vec<PathBuf> {
-    [
-        home.join("Library")
-            .join("CloudStorage")
-            .join("Dropbox")
-            .join("Runki"),
-        home.join("Dropbox").join("Runki"),
-        home.join("Library")
-            .join("Mobile Documents")
-            .join("com~apple~CloudDocs")
-            .join("Runki"),
-    ]
-    .into_iter()
-    .filter(|path| path.parent().is_some_and(Path::is_dir))
-    .collect()
-}
-
 /// Whether the deck at `source` already sits directly in `library`
 /// (canonical parent directories match), so no copy is needed.
 fn is_in_library(source: &Path, library: &Path) -> bool {
@@ -1200,31 +1173,6 @@ mod tests {
         assert_eq!(last_opened_label(now - 1_000, now), "today");
         assert_eq!(last_opened_label(99 * DAY, now), "yesterday");
         assert_eq!(last_opened_label(97 * DAY, now), "3 days ago");
-    }
-
-    #[test]
-    fn suggested_folders_need_an_existing_parent() {
-        let (home, _temp) = temp_dir("suggested");
-        assert!(suggested_library_folders_in(&home).is_empty());
-
-        std::fs::create_dir_all(home.join("Dropbox")).expect("dropbox parent");
-        std::fs::create_dir_all(
-            home.join("Library")
-                .join("Mobile Documents")
-                .join("com~apple~CloudDocs"),
-        )
-        .expect("icloud parent");
-        let suggested = suggested_library_folders_in(&home);
-        assert_eq!(
-            suggested,
-            [
-                home.join("Dropbox").join("Runki"),
-                home.join("Library")
-                    .join("Mobile Documents")
-                    .join("com~apple~CloudDocs")
-                    .join("Runki"),
-            ]
-        );
     }
 
     #[test]

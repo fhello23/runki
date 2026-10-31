@@ -24,10 +24,10 @@ Still no spaced repetition and no grading: "seen" is just a checkmark.
 ## User-facing behaviour
 
 ### Library screen (new start screen)
-- First launch: "Choose a library folder…" (folder picker). Offer
-  `~/Library/CloudStorage/Dropbox/Runki`, `~/Dropbox/Runki` or
-  `~/Library/Mobile Documents/com~apple~CloudDocs/Runki` as shortcuts if
-  their parent exists. The folder can be changed later. If the folder is
+- First launch: "Choose a library folder…" (folder picker, with New
+  Folder enabled) and a hint that any folder works, iCloud Drive or
+  Dropbox included. No folders are suggested: the user always picks.
+  The folder can be changed later. If the folder is
   missing/unreadable, say so and offer to choose another.
 - One row per deck file (`.apkg`, `.csv`, `.tsv`, `.txt`, case-insensitive)
   directly in the folder: name, card count, progress bar `seen / total`,
