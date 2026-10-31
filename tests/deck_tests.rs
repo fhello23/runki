@@ -1,7 +1,8 @@
 use std::io::{Cursor, Write};
 use std::path::PathBuf;
 
-use runki::deck::{clean_html, load_deck, load_later, parse_delimited, save_later};
+use runki::deck::{clean_html, load_deck, parse_delimited};
+use runki::progress::{load, save, state_path, DeckState};
 
 #[test]
 fn clean_html_strips_markup() {
@@ -37,12 +38,13 @@ fn later_list_roundtrips() {
     let dir = temp_dir("later");
     let deck_path = dir.join("deck.tsv");
     std::fs::write(&deck_path, "Q\tA\n").unwrap();
-    let mut later = std::collections::HashSet::new();
-    later.insert("abc".to_string());
-    later.insert("123".to_string());
-    save_later(&deck_path, &later).unwrap();
-    assert_eq!(load_later(&deck_path).unwrap(), later);
-    assert!(dir.join("deck.tsv.later.json").exists());
+    let mut state = DeckState::new();
+    state.set_later("abc", true, 1);
+    state.set_later("123", true, 1);
+    let path = state_path(&deck_path, None);
+    save(&path, &state).unwrap();
+    assert_eq!(load(&deck_path, &path).state(), &state);
+    assert!(dir.join("deck.tsv.runki.json").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
