@@ -23,6 +23,7 @@ use crate::deck::{self, Card};
 use crate::library::{self, DeckEntry, DeckStatus, LibraryLoader};
 use crate::progress::{self, CardFilter, CardOrder, LoadOutcome};
 use crate::session::StudySession;
+use crate::VERSION;
 
 /// How often a dirty state is written while studying.
 const SAVE_INTERVAL: Duration = Duration::from_secs(2);
@@ -603,6 +604,8 @@ impl RunkiApp {
                 if ui.button("Open deck…").clicked() {
                     self.pick_and_open();
                 }
+                ui.separator();
+                ui.weak(format!("v{VERSION}"));
             });
         });
     }
@@ -633,6 +636,7 @@ impl RunkiApp {
         ui.vertical_centered(|ui| {
             ui.add_space(80.0);
             ui.heading("Runki");
+            ui.weak(format!("v{VERSION}"));
             ui.add_space(8.0);
             ui.label(
                 "Choose a library folder for your decks. Decks and progress \
@@ -756,6 +760,7 @@ impl RunkiApp {
                     ui.add_space(80.0);
                     let Some(session) = &self.session else {
                         ui.heading("Runki");
+                        ui.weak(format!("v{VERSION}"));
                         ui.add_space(8.0);
                         ui.label("Open an .apkg, .csv, .tsv, or .txt deck, or drop the file here.");
                         ui.add_space(4.0);
