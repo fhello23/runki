@@ -25,8 +25,8 @@ cargo run --release -- sample-deck.tsv
 Runki opens on a library screen: the decks in one folder, each with
 its card count, `seen / total` progress, study-later count, and when
 you last opened it (most recent first). On first launch you pick the
-folder — shortcuts are offered for a `Runki` folder inside Dropbox or
-iCloud Drive when those exist. Because decks and progress both live
+folder (the picker can create a new one, e.g. `Runki` in iCloud
+Drive). Because decks and progress both live
 in the folder, putting it in Dropbox or iCloud Drive syncs everything
 between Macs; any local folder works too. The folder can be changed
 later with **Change folder…**, and the choice is remembered per Mac.

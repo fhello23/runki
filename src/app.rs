@@ -297,18 +297,13 @@ impl RunkiApp {
     }
 
     fn choose_library_folder(&mut self) {
-        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+        // New Folder lets the user make e.g. a `Runki` folder inside
+        // iCloud Drive right from the picker.
+        if let Some(dir) = rfd::FileDialog::new()
+            .set_can_create_directories(true)
+            .pick_folder()
+        {
             self.set_library(dir);
-        }
-    }
-
-    /// Use one of the suggested `…/Runki` folders, creating it first.
-    fn choose_suggested_library(&mut self, dir: PathBuf) {
-        match std::fs::create_dir_all(&dir) {
-            Ok(()) => self.set_library(dir),
-            Err(err) => {
-                self.error = Some(format!("Could not create {}: {err}", dir.display()));
-            }
         }
     }
 
@@ -632,8 +627,8 @@ impl RunkiApp {
         });
     }
 
-    /// First-launch view: pick a library folder (with synced-folder
-    /// shortcuts), or just open a one-off deck.
+    /// First-launch view: pick a library folder, or just open a
+    /// one-off deck. No folder is suggested: the user always picks.
     fn welcome(&mut self, ui: &mut egui::Ui) {
         ui.vertical_centered(|ui| {
             ui.add_space(80.0);
@@ -653,16 +648,11 @@ impl RunkiApp {
             {
                 self.choose_library_folder();
             }
-            for dir in library::suggested_library_folders() {
-                ui.add_space(8.0);
-                if ui
-                    .button(format!("Use {}", dir.display()))
-                    .on_hover_text("Create this folder and use it as the library")
-                    .clicked()
-                {
-                    self.choose_suggested_library(dir);
-                }
-            }
+            ui.add_space(8.0);
+            ui.weak(
+                "Any folder works. Pick one in iCloud Drive or Dropbox \
+                 to sync your decks between Macs.",
+            );
             ui.add_space(24.0);
             ui.label("Or open a deck file without a library:");
             ui.add_space(8.0);
