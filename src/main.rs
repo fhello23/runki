@@ -1,5 +1,8 @@
 use std::path::PathBuf;
 
+#[cfg(target_os = "macos")]
+mod about_macos;
+
 use runki::app::RunkiApp;
 
 fn main() -> eframe::Result<()> {
@@ -17,6 +20,10 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Runki",
         options,
-        Box::new(move |_cc| Ok(Box::new(RunkiApp::new(initial_deck)))),
+        Box::new(move |_cc| {
+            #[cfg(target_os = "macos")]
+            about_macos::install();
+            Ok(Box::new(RunkiApp::new(initial_deck)))
+        }),
     )
 }
