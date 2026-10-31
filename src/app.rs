@@ -87,33 +87,48 @@ impl RunkiApp {
         }
     }
 
-    /// Indices of the cards visible in the current mode.
-    fn view(&self) -> Vec<usize> {
+    /// Indices of the flagged cards, visible in `Mode::Later`.
+    fn later_view(&self) -> Vec<usize> {
         let Some(deck) = &self.deck else {
             return Vec::new();
         };
+        deck.cards
+            .iter()
+            .enumerate()
+            .filter(|(_, card)| self.later.contains(&card.id))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Number of cards visible in the current mode.
+    fn view_len(&self) -> usize {
+        let Some(deck) = &self.deck else {
+            return 0;
+        };
         match self.mode {
-            Mode::All => (0..deck.cards.len()).collect(),
-            Mode::Later => deck
-                .cards
-                .iter()
-                .enumerate()
-                .filter(|(_, card)| self.later.contains(&card.id))
-                .map(|(i, _)| i)
-                .collect(),
+            Mode::All => deck.cards.len(),
+            Mode::Later => self.later_count(),
         }
     }
 
-    fn current(&self) -> Option<(deck::Card, usize, usize)> {
+    /// Index into `deck.cards` of the card at `self.pos` in the view.
+    fn current_index(&self) -> Option<usize> {
         let deck = self.deck.as_ref()?;
-        let view = self.view();
-        let idx = *view.get(self.pos)?;
-        Some((deck.cards[idx].clone(), self.pos + 1, view.len()))
+        match self.mode {
+            Mode::All => (self.pos < deck.cards.len()).then_some(self.pos),
+            Mode::Later => self.later_view().get(self.pos).copied(),
+        }
+    }
+
+    fn current(&self) -> Option<(&deck::Card, usize, usize)> {
+        let deck = self.deck.as_ref()?;
+        let idx = self.current_index()?;
+        Some((&deck.cards[idx], self.pos + 1, self.view_len()))
     }
 
     /// Space: reveal the answer, or advance (wrapping) if already shown.
     fn space(&mut self) {
-        let view_len = self.view().len();
+        let view_len = self.view_len();
         if view_len == 0 {
             return;
         }
@@ -127,11 +142,11 @@ impl RunkiApp {
 
     /// L: toggle the current card in the study-later list and save.
     fn toggle_later(&mut self) {
-        let Some((card, _, _)) = self.current() else {
+        let Some(card_id) = self.current().map(|(card, _, _)| card.id.clone()) else {
             return;
         };
-        if !self.later.insert(card.id.clone()) {
-            self.later.remove(&card.id);
+        if !self.later.insert(card_id.clone()) {
+            self.later.remove(&card_id);
         }
         if !self.later_save_blocked {
             if let Some(deck) = &self.deck {
@@ -143,14 +158,14 @@ impl RunkiApp {
         }
         // Unflagging while reviewing the later list shrinks the view;
         // keep the position pointing at the next remaining card.
-        let view_len = self.view().len();
+        let view_len = self.view_len();
         if view_len == 0 {
             self.pos = 0;
         } else if self.pos >= view_len {
             self.pos = view_len - 1;
         }
         // If a different card is now shown, hide its answer.
-        if self.current().map(|(c, _, _)| c.id) != Some(card.id) {
+        if self.current().map(|(c, _, _)| &c.id) != Some(&card_id) {
             self.revealed = false;
         }
     }
@@ -238,7 +253,9 @@ impl RunkiApp {
     }
 
     fn bottom_bar(&mut self, ctx: &egui::Context) {
-        let current = self.current();
+        let current = self
+            .current()
+            .map(|(card, n, total)| (self.later.contains(&card.id), n, total));
         egui::TopBottomPanel::bottom("bottom").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.add_enabled_ui(current.is_some(), |ui| {
@@ -253,9 +270,7 @@ impl RunkiApp {
                     {
                         self.space();
                     }
-                    let flagged = current
-                        .as_ref()
-                        .is_some_and(|(card, _, _)| self.later.contains(&card.id));
+                    let flagged = current.is_some_and(|(flagged, _, _)| flagged);
                     let label = if flagged {
                         "In study-later list  (L)"
                     } else {
@@ -267,7 +282,7 @@ impl RunkiApp {
                         self.toggle_later();
                     }
                 });
-                if let Some((_, n, total)) = &current {
+                if let Some((_, n, total)) = current {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(format!("{n} / {total}"));
                     });
@@ -295,7 +310,7 @@ impl RunkiApp {
                     if self.deck.is_none() {
                         ui.heading("Runki");
                         ui.add_space(8.0);
-                        ui.label("Open an .apkg, .csv, or .tsv deck, or drop the file here.");
+                        ui.label("Open an .apkg, .csv, .tsv, or .txt deck, or drop the file here.");
                         ui.add_space(4.0);
                         ui.label("Space: show answer / next card.  L: study later.");
                         ui.add_space(16.0);
@@ -345,16 +360,25 @@ mod tests {
     use super::*;
     use crate::deck::Card;
 
+    struct TempDir(std::path::PathBuf);
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     fn test_app(
         test_name: &str,
         later: &[&str],
         mode: Mode,
         pos: usize,
         revealed: bool,
-    ) -> RunkiApp {
+    ) -> (RunkiApp, TempDir) {
         let dir =
             std::env::temp_dir().join(format!("runki-test-{}-{}", test_name, std::process::id()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
+        let guard = TempDir(dir.clone());
         let cards = ["a", "b", "c"]
             .into_iter()
             .map(|id| Card {
@@ -363,7 +387,7 @@ mod tests {
                 back: format!("back {id}"),
             })
             .collect();
-        RunkiApp {
+        let app = RunkiApp {
             deck: Some(Deck {
                 name: "test".to_string(),
                 path: dir.join("deck.csv"),
@@ -375,12 +399,14 @@ mod tests {
             later: later.iter().map(|id| (*id).to_string()).collect(),
             later_save_blocked: false,
             error: None,
-        }
+        };
+        (app, guard)
     }
 
     #[test]
     fn later_unflag_first_hides_next_cards_answer() {
-        let mut app = test_app("later-unflag-first", &["a", "b", "c"], Mode::Later, 0, true);
+        let (mut app, _temp) =
+            test_app("later-unflag-first", &["a", "b", "c"], Mode::Later, 0, true);
 
         app.toggle_later();
 
@@ -392,7 +418,7 @@ mod tests {
 
     #[test]
     fn later_unflag_middle_hides_next_cards_answer() {
-        let mut app = test_app(
+        let (mut app, _temp) = test_app(
             "later-unflag-middle",
             &["a", "b", "c"],
             Mode::Later,
@@ -410,25 +436,19 @@ mod tests {
 
     #[test]
     fn later_unflag_last_remaining_empties_view() {
-        let mut app = test_app("later-unflag-last", &["a"], Mode::Later, 0, true);
+        let (mut app, _temp) = test_app("later-unflag-last", &["a"], Mode::Later, 0, true);
 
         app.toggle_later();
 
         assert_eq!(app.pos, 0);
         assert!(!app.revealed);
         assert!(app.current().is_none());
-        assert!(app.view().is_empty());
-    }
-
-    fn cleanup(app: &RunkiApp) {
-        if let Some(dir) = app.deck.as_ref().and_then(|d| d.path.parent()) {
-            let _ = std::fs::remove_dir_all(dir);
-        }
+        assert_eq!(app.view_len(), 0);
     }
 
     #[test]
     fn later_count_ignores_stale_ids() {
-        let app = test_app(
+        let (app, _temp) = test_app(
             "later-count-stale",
             &["a", "stale-1", "stale-2"],
             Mode::All,
@@ -440,12 +460,11 @@ mod tests {
         // Stale ids are not deleted from the in-memory set (or file).
         assert_eq!(app.later.len(), 3);
         assert!(app.later.contains("stale-1"));
-        cleanup(&app);
     }
 
     #[test]
     fn error_cleared_after_successful_save() {
-        let mut app = test_app("error-cleared-on-save", &[], Mode::All, 0, false);
+        let (mut app, _temp) = test_app("error-cleared-on-save", &[], Mode::All, 0, false);
         // Make the first save fail by occupying the sidecar path with a dir.
         let deck_path = app.deck.as_ref().expect("deck").path.clone();
         let sidecar = deck::later_path(&deck_path);
@@ -457,12 +476,11 @@ mod tests {
         std::fs::remove_dir_all(&sidecar).expect("remove blocking dir");
         app.toggle_later();
         assert_eq!(app.error, None, "successful save should clear error");
-        cleanup(&app);
     }
 
     #[test]
     fn all_toggle_flag_keeps_answer_shown_on_same_card() {
-        let mut app = test_app("all-toggle-flag", &[], Mode::All, 0, true);
+        let (mut app, _temp) = test_app("all-toggle-flag", &[], Mode::All, 0, true);
 
         app.toggle_later();
 
