@@ -26,9 +26,10 @@ You can also drag a deck file onto the window.
 
 | Key / button | Action |
 | --- | --- |
-| `Space` | Show the answer; press again for the next card (wraps around at the end) |
+| `Space` or click the card | Show the answer; press again for the next card (wraps around at the end) |
 | `L` | Toggle the current card in the study-later list |
-| Top-right toggle | Switch between all cards and study-later only |
+| All / Later toggle | Switch between all cards and study-later only |
+| Top-right icon | Cycle the theme: match system, light, dark (remembered between launches) |
 
 ## Deck formats
 

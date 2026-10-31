@@ -1,7 +1,7 @@
 //! egui front-end: one card at a time.
 //!
-//! - `Space` shows the answer, then moves to the next card (wrapping
-//!   around at the end, so browsing never stops).
+//! - `Space` (or a click on the card) shows the answer, then moves to
+//!   the next card (wrapping around at the end, so browsing never stops).
 //! - `L` toggles the current card in the study-later list.
 //! - The top bar switches between all cards and study-later only.
 
@@ -12,6 +12,7 @@ use eframe::egui;
 
 use crate::deck::{self, Deck};
 use crate::progress::{self, DeckState, LoadOutcome};
+use crate::theme::{self, Palette};
 
 /// How often a dirty state is written while studying.
 const SAVE_INTERVAL: Duration = Duration::from_secs(2);
@@ -24,6 +25,8 @@ enum Mode {
 
 pub struct RunkiApp {
     deck: Option<Deck>,
+    /// Light, dark or follow the system; saved in the app config.
+    theme: egui::ThemePreference,
     /// Index into the current view (all cards, or flagged only).
     pos: usize,
     revealed: bool,
@@ -47,6 +50,7 @@ impl RunkiApp {
     pub fn new(initial_deck: Option<PathBuf>) -> Self {
         let mut app = Self {
             deck: None,
+            theme: egui::ThemePreference::System,
             pos: 0,
             revealed: false,
             mode: Mode::All,
@@ -62,6 +66,12 @@ impl RunkiApp {
             app.open_path(path);
         }
         app
+    }
+
+    /// Start with this theme choice (as loaded from the app config).
+    pub fn with_theme(mut self, theme: egui::ThemePreference) -> Self {
+        self.theme = theme;
+        self
     }
 
     fn open_path(&mut self, path: PathBuf) {
@@ -268,6 +278,16 @@ impl RunkiApp {
 }
 
 impl eframe::App for RunkiApp {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        theme::store(storage, self.theme);
+    }
+
+    /// Only settings saved in [`Self::save`] are kept; egui's own
+    /// memory (which includes its styles) is rebuilt on every launch.
+    fn persist_egui_memory(&self) -> bool {
+        false
+    }
+
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.save_now();
     }
@@ -296,151 +316,478 @@ impl eframe::App for RunkiApp {
             ctx.request_repaint_after(delay);
         }
 
-        self.top_bar(ctx);
-        self.bottom_bar(ctx);
-        self.central(ctx);
+        let p = Palette::of(ctx);
+        self.top_bar(ctx, &p);
+        // The welcome screen has nothing to study, so no bottom bar.
+        if self.deck.is_some() {
+            self.bottom_bar(ctx, &p);
+        }
+        self.central(ctx, &p);
+        drop_overlay(ctx, &p);
     }
 }
 
+/// Widest a card gets; very long lines are hard to read.
+const CARD_MAX_WIDTH: f32 = 680.0;
+/// Shortest a card gets, so a one-word question still looks like a card.
+const CARD_MIN_HEIGHT: f32 = 240.0;
+/// Room for the window buttons: on macOS the content runs under a
+/// transparent title bar (see `main.rs`).
+const TITLEBAR_INSET: i8 = if cfg!(target_os = "macos") { 28 } else { 0 };
+
 impl RunkiApp {
-    fn top_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("Open deck...").clicked() {
-                    self.pick_and_open();
-                }
-                ui.separator();
-                match &self.deck {
-                    Some(deck) => {
-                        ui.strong(&deck.name);
-                        ui.label(format!("{} cards", deck.cards.len()));
-                    }
-                    None => {
-                        ui.label("No deck open");
-                    }
-                }
+    fn top_bar(&mut self, ctx: &egui::Context, p: &Palette) {
+        let frame = egui::Frame::new().fill(p.bg).inner_margin(egui::Margin {
+            left: 20,
+            right: 16,
+            top: TITLEBAR_INSET + 12,
+            bottom: 8,
+        });
+        egui::TopBottomPanel::top("top")
+            .frame(frame)
+            .show_separator_line(false)
+            .show(ctx, |ui| {
+                // One row height, so the name lines up with the controls.
+                ui.spacing_mut().interact_size.y = 30.0;
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let later_label = format!("Study later ({})", self.later_count());
-                    if ui
-                        .selectable_label(self.mode == Mode::Later, later_label)
-                        .clicked()
-                    {
-                        self.set_mode(Mode::Later);
+                    if theme_toggle(ui, p, self.theme) {
+                        self.theme = theme::next(self.theme);
+                        ctx.set_theme(self.theme);
+                        // Redraw at once with the new palette.
+                        ctx.request_discard("theme changed");
                     }
-                    if ui
-                        .selectable_label(self.mode == Mode::All, "All cards")
-                        .clicked()
-                    {
-                        self.set_mode(Mode::All);
+                    // The welcome screen has its own Open button.
+                    let Some(deck) = &self.deck else {
+                        return;
+                    };
+                    let name = egui::RichText::new(&deck.name).size(15.0).color(p.text);
+                    let open = egui::Button::new(egui::RichText::new("Open…").color(p.muted));
+                    if ui.add(open).on_hover_text("Open another deck").clicked() {
+                        self.pick_and_open();
                     }
+                    ui.add_space(4.0);
+                    // Right to left, so the segments are listed last first.
+                    let later = match self.later_count() {
+                        0 => "Later".to_string(),
+                        n => format!("Later  {n}"),
+                    };
+                    let segments = [(Mode::Later, later.as_str()), (Mode::All, "All")];
+                    if let Some(mode) = segmented(ui, p, self.mode, &segments) {
+                        self.set_mode(mode);
+                    }
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add(egui::Label::new(name).truncate());
+                    });
                 });
             });
-        });
     }
 
-    fn bottom_bar(&mut self, ctx: &egui::Context) {
-        let current = self
+    fn bottom_bar(&mut self, ctx: &egui::Context, p: &Palette) {
+        let flagged = self
             .current()
-            .map(|(card, n, total)| (self.state.is_later(&card.id), n, total));
-        egui::TopBottomPanel::bottom("bottom").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.add_enabled_ui(current.is_some(), |ui| {
-                    let label = if self.revealed {
-                        "Next card  (Space)"
-                    } else {
-                        "Show answer  (Space)"
-                    };
-                    if ui
-                        .add(egui::Button::new(egui::RichText::new(label).size(18.0)))
-                        .clicked()
-                    {
+            .map(|(card, _, _)| self.state.is_later(&card.id));
+        let frame = egui::Frame::new().fill(p.bg).inner_margin(egui::Margin {
+            left: 20,
+            right: 20,
+            top: 6,
+            bottom: 18,
+        });
+        egui::TopBottomPanel::bottom("bottom")
+            .frame(frame)
+            .show_separator_line(false)
+            .show(ctx, |ui| {
+                // Nothing to act on (empty view): keep the bar's height.
+                let Some(flagged) = flagged else {
+                    ui.add_space(30.0);
+                    return;
+                };
+                centered_row(ui, |ui| {
+                    let label = if self.revealed { "Next" } else { "Show answer" };
+                    if key_hint(ui, p, "Space", label, p.muted).clicked() {
                         self.space();
                     }
-                    let flagged = current.is_some_and(|(flagged, _, _)| flagged);
-                    let label = if flagged {
-                        "In study-later list  (L)"
+                    let (label, color) = if flagged {
+                        ("Saved for later", p.accent)
                     } else {
-                        "Study later  (L)"
+                        ("Study later", p.muted)
                     };
-                    let button =
-                        egui::Button::new(egui::RichText::new(label).size(18.0)).selected(flagged);
-                    if ui.add(button).clicked() {
+                    if key_hint(ui, p, "L", label, color).clicked() {
                         self.toggle_later();
                     }
                 });
-                if let Some((_, n, total)) = current {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(format!("{n} / {total}"));
-                    });
-                }
             });
-        });
     }
 
-    fn central(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            for slot in [&mut self.error, &mut self.save_error] {
-                if let Some(error) = slot.clone() {
-                    ui.add_space(16.0);
-                    ui.horizontal(|ui| {
-                        ui.colored_label(egui::Color32::LIGHT_RED, error);
-                        if ui.small_button("×").clicked() {
-                            *slot = None;
-                        }
-                    });
-                    ui.add_space(16.0);
-                }
+    fn central(&mut self, ctx: &egui::Context, p: &Palette) {
+        let frame = egui::Frame::new().fill(p.bg).inner_margin(egui::Margin {
+            left: 24,
+            right: 24,
+            top: 8,
+            bottom: 8,
+        });
+        egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
+            let width = ui.available_width().min(CARD_MAX_WIDTH);
+            self.error_banners(ui, p, width);
+
+            if self.deck.is_none() {
+                self.welcome(ui, p);
+                return;
             }
 
-            let Some(current) = self.current() else {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(80.0);
-                    if self.deck.is_none() {
-                        ui.heading("Runki");
-                        ui.add_space(8.0);
-                        ui.label("Open an .apkg, .csv, .tsv, or .txt deck, or drop the file here.");
-                        ui.add_space(4.0);
-                        ui.label("Space: show answer / next card.  L: study later.");
-                        ui.add_space(16.0);
-                        if ui
-                            .add(egui::Button::new(
-                                egui::RichText::new("Open deck...").size(20.0),
-                            ))
-                            .clicked()
-                        {
-                            self.pick_and_open();
-                        }
-                    } else if self.mode == Mode::Later {
-                        ui.heading("Nothing flagged yet");
-                        ui.add_space(8.0);
-                        ui.label("Press L on a card to add it to this list.");
-                    } else {
-                        ui.heading("This deck has no cards to show");
-                    }
+            let Some((card, n, total)) = self.current() else {
+                let (title, hint) = if self.mode == Mode::Later {
+                    (
+                        "Nothing saved for later",
+                        "Press L on any card to keep it here.",
+                    )
+                } else {
+                    ("This deck has no cards", "Try opening another deck.")
+                };
+                let height = ui.available_height();
+                centered_v(ui, height, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.label(egui::RichText::new(title).size(20.0).color(p.text));
+                        ui.label(egui::RichText::new(hint).color(p.muted));
+                    });
                 });
                 return;
             };
+            let flagged = self.state.is_later(&card.id);
+            let (front, back) = (card.front.clone(), card.back.clone());
 
-            let (card, _, _) = current;
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.add_space(24.0);
-                ui.vertical_centered(|ui| {
-                    if self.state.is_later(&card.id) {
-                        ui.small("STUDY LATER");
-                        ui.add_space(8.0);
-                    }
-                    ui.add(egui::Label::new(egui::RichText::new(&card.front).size(30.0)).wrap());
-                    if self.revealed {
-                        ui.add_space(16.0);
-                        ui.separator();
-                        ui.add_space(16.0);
-                        ui.add(egui::Label::new(egui::RichText::new(&card.back).size(26.0)).wrap());
-                    }
-                    ui.add_space(24.0);
+            let height = ui.available_height();
+            let mut card_clicked = false;
+            egui::ScrollArea::vertical()
+                .auto_shrink(false)
+                .show(ui, |ui| {
+                    centered_v(ui, height, |ui| {
+                        ui.vertical_centered(|ui| {
+                            card_clicked = study_card(
+                                ui,
+                                p,
+                                width,
+                                &front,
+                                self.revealed.then_some(back.as_str()),
+                                flagged,
+                            );
+                            ui.add_space(12.0);
+                            progress_row(ui, p, n, total);
+                        });
+                    });
+                });
+            if card_clicked {
+                self.space();
+            }
+        });
+    }
+
+    fn error_banners(&mut self, ui: &mut egui::Ui, p: &Palette, width: f32) {
+        for slot in [&mut self.error, &mut self.save_error] {
+            let Some(error) = slot.clone() else {
+                continue;
+            };
+            ui.vertical_centered(|ui| {
+                ui.allocate_ui(egui::vec2(width, 0.0), |ui| {
+                    egui::Frame::new()
+                        .fill(p.danger_bg)
+                        .corner_radius(10)
+                        .inner_margin(egui::Margin::symmetric(14, 10))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                                let close = egui::Button::new(
+                                    egui::RichText::new("×").size(18.0).color(p.danger),
+                                )
+                                .frame(false);
+                                if ui.add(close).on_hover_text("Dismiss").clicked() {
+                                    *slot = None;
+                                }
+                                ui.with_layout(
+                                    egui::Layout::left_to_right(egui::Align::Min),
+                                    |ui| {
+                                        let text = egui::RichText::new(error).color(p.danger);
+                                        ui.add(egui::Label::new(text).wrap());
+                                    },
+                                );
+                            });
+                        });
+                });
+            });
+            ui.add_space(4.0);
+        }
+    }
+
+    fn welcome(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let height = ui.available_height();
+        centered_v(ui, height, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new("Runki").size(36.0).color(p.text));
+                ui.label(
+                    egui::RichText::new("Flip through your decks. Nothing to grade.")
+                        .color(p.muted),
+                );
+                ui.add_space(28.0);
+                let open = egui::Button::new(
+                    egui::RichText::new("Open deck")
+                        .size(15.0)
+                        .color(p.on_accent),
+                )
+                .fill(p.accent)
+                .corner_radius(10)
+                .min_size(egui::vec2(160.0, 40.0));
+                if ui
+                    .add(open)
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
+                {
+                    self.pick_and_open();
+                }
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new("or drop an .apkg, .csv, .tsv or .txt file here")
+                        .size(12.0)
+                        .color(p.muted),
+                );
+                ui.add_space(40.0);
+                centered_row(ui, |ui| {
+                    keycap(ui, p, "Space");
+                    ui.label(egui::RichText::new("answer, then next").color(p.muted));
+                    ui.add_space(16.0);
+                    keycap(ui, p, "L");
+                    ui.label(egui::RichText::new("study later").color(p.muted));
                 });
             });
         });
     }
+}
+
+/// The card itself: question, then the answer once revealed. Returns
+/// whether it was clicked (which acts like Space).
+fn study_card(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    width: f32,
+    front: &str,
+    back: Option<&str>,
+    flagged: bool,
+) -> bool {
+    let shown = ui.allocate_ui(egui::vec2(width, 0.0), |ui| {
+        egui::Frame::new()
+            .fill(p.surface)
+            .stroke(egui::Stroke::new(1.0, p.line))
+            .corner_radius(16)
+            .shadow(egui::Shadow {
+                offset: [0, 6],
+                blur: 24,
+                spread: 0,
+                color: p.shadow,
+            })
+            .inner_margin(egui::Margin::symmetric(40, 36))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                centered_v(ui, CARD_MIN_HEIGHT - 72.0, |ui| {
+                    ui.vertical_centered(|ui| {
+                        let front = egui::RichText::new(front).size(26.0).color(p.text);
+                        ui.add(egui::Label::new(front).wrap());
+                        if let Some(back) = back {
+                            ui.add(egui::Separator::default().spacing(40.0));
+                            let back = egui::RichText::new(back).size(20.0).color(p.text_soft);
+                            ui.add(egui::Label::new(back).wrap());
+                        }
+                    });
+                });
+            })
+            .response
+            .rect
+    });
+    let rect = shown.inner;
+
+    if flagged {
+        let anchor = rect.right_top() + egui::vec2(-20.0, 18.0);
+        let text = ui.painter().text(
+            anchor,
+            egui::Align2::RIGHT_TOP,
+            "Later",
+            egui::FontId::proportional(12.0),
+            p.accent,
+        );
+        ui.painter().circle_filled(
+            egui::pos2(text.left() - 8.0, text.center().y),
+            3.0,
+            p.accent,
+        );
+    }
+
+    ui.interact(rect, ui.id().with("card"), egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .clicked()
+}
+
+/// Where we are in the view: a thin bar and `n / total`.
+fn progress_row(ui: &mut egui::Ui, p: &Palette, n: usize, total: usize) {
+    centered_row(ui, |ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(96.0, 4.0), egui::Sense::hover());
+        ui.painter().rect_filled(rect, 2, p.line);
+        let done = rect.width() * n as f32 / total.max(1) as f32;
+        let fill = egui::Rect::from_min_size(rect.min, egui::vec2(done, rect.height()));
+        ui.painter().rect_filled(fill, 2, p.accent);
+        ui.label(
+            egui::RichText::new(format!("{n} / {total}"))
+                .size(12.0)
+                .color(p.muted),
+        );
+    });
+}
+
+/// A segmented control; returns the newly picked value, if any.
+fn segmented<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    selected: T,
+    segments: &[(T, &str)],
+) -> Option<T> {
+    let mut picked = None;
+    egui::Frame::new()
+        .fill(p.line)
+        .corner_radius(9)
+        .inner_margin(3)
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            ui.horizontal(|ui| {
+                for &(value, label) in segments {
+                    let on = value == selected;
+                    let text = egui::RichText::new(label).color(if on { p.text } else { p.muted });
+                    let fill = if on {
+                        p.chip
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    };
+                    let button = egui::Button::new(text)
+                        .fill(fill)
+                        .corner_radius(7)
+                        .min_size(egui::vec2(0.0, 24.0));
+                    if ui.add(button).clicked() && !on {
+                        picked = Some(value);
+                    }
+                }
+            });
+        });
+    picked
+}
+
+/// The light / dark / system button; returns whether it was clicked.
+fn theme_toggle(ui: &mut egui::Ui, p: &Palette, current: egui::ThemePreference) -> bool {
+    let next = theme::next(current);
+    let icon = egui::RichText::new(theme::icon(current))
+        .size(16.0)
+        .color(p.muted);
+    ui.add(egui::Button::new(icon).min_size(egui::vec2(30.0, 30.0)))
+        .on_hover_text(format!(
+            "Theme: {}. Click for {}.",
+            theme::name(current),
+            theme::name(next).to_lowercase()
+        ))
+        .clicked()
+}
+
+/// A key drawn as a small keycap.
+fn keycap(ui: &mut egui::Ui, p: &Palette, key: &str) {
+    egui::Frame::new()
+        .fill(p.surface)
+        .stroke(egui::Stroke::new(1.0, p.line))
+        .corner_radius(5)
+        .inner_margin(egui::Margin::symmetric(6, 1))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(key).size(11.0).color(p.muted));
+        });
+}
+
+/// A clickable "keycap + label" hint, for mouse users.
+fn key_hint(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    key: &str,
+    label: &str,
+    color: egui::Color32,
+) -> egui::Response {
+    let background = ui.painter().add(egui::Shape::Noop);
+    let response = ui
+        .scope_builder(egui::UiBuilder::new().sense(egui::Sense::click()), |ui| {
+            egui::Frame::new()
+                .inner_margin(egui::Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        keycap(ui, p, key);
+                        ui.label(egui::RichText::new(label).color(color));
+                    });
+                });
+        })
+        .response;
+    if response.hovered() {
+        ui.painter().set(
+            background,
+            egui::epaint::RectShape::filled(response.rect, 8, p.hover),
+        );
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Lay out a row centred horizontally, using the width it measured on
+/// the previous pass (a changed width triggers one discarded pass).
+fn centered_row(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
+    let id = ui.id().with("centered_row");
+    let last: f32 = ui.ctx().data(|d| d.get_temp(id)).unwrap_or(0.0);
+    let pad = ((ui.available_width() - last) / 2.0).max(0.0);
+    ui.horizontal(|ui| {
+        ui.add_space(pad);
+        let width = ui.horizontal(add_contents).response.rect.width();
+        remember_size(ui, id, last, width);
+    });
+}
+
+/// Lay out contents centred vertically in `height`, using the height
+/// measured on the previous pass, and take up at least `height`.
+fn centered_v(ui: &mut egui::Ui, height: f32, add_contents: impl FnOnce(&mut egui::Ui)) {
+    let id = ui.id().with("centered_v");
+    let last: f32 = ui.ctx().data(|d| d.get_temp(id)).unwrap_or(0.0);
+    let pad = ((height - last) / 2.0).max(0.0);
+    ui.add_space(pad);
+    let measured = ui.vertical(add_contents).response.rect.height();
+    remember_size(ui, id, last, measured);
+    ui.add_space((height - pad - measured).max(0.0));
+}
+
+fn remember_size(ui: &egui::Ui, id: egui::Id, last: f32, measured: f32) {
+    if (measured - last).abs() > 0.5 {
+        ui.ctx().data_mut(|d| d.insert_temp(id, measured));
+        ui.ctx().request_discard("re-centre after a size change");
+    }
+}
+
+/// While a file is dragged over the window, say it can be dropped.
+fn drop_overlay(ctx: &egui::Context, p: &Palette) {
+    if ctx.input(|i| i.raw.hovered_files.is_empty()) {
+        return;
+    }
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("drop_overlay"),
+    ));
+    let screen = ctx.screen_rect();
+    painter.rect_filled(screen, 0, p.bg.gamma_multiply(0.92));
+    painter.rect_stroke(
+        screen.shrink(16.0),
+        16,
+        egui::Stroke::new(2.0, p.accent),
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        screen.center(),
+        egui::Align2::CENTER_CENTER,
+        "Drop to open",
+        egui::FontId::proportional(20.0),
+        p.accent,
+    );
 }
 
 #[cfg(test)]
@@ -482,6 +829,7 @@ mod tests {
         }
         let state_path = progress::state_path(&deck_path, None);
         let app = RunkiApp {
+            theme: egui::ThemePreference::System,
             deck: Some(Deck {
                 name: "test".to_string(),
                 path: deck_path,
