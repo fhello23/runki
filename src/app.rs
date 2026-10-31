@@ -227,11 +227,17 @@ impl RunkiApp {
                 match &self.session {
                     Some(session) => {
                         ui.strong(&session.deck().name);
-                        ui.label(format!(
-                            "{} / {} seen",
-                            session.seen_count(),
-                            session.total()
-                        ));
+                        let seen = session.seen_count();
+                        ui.label(format!("{seen} / {} seen", session.total()));
+                        // Starting over must not require seeing every card first.
+                        if seen > 0
+                            && ui
+                                .small_button("Reset…")
+                                .on_hover_text("Clear which cards you have seen")
+                                .clicked()
+                        {
+                            self.show_reset_confirm = true;
+                        }
                     }
                     None => {
                         ui.label("No deck open");

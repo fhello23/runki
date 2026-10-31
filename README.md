@@ -34,7 +34,8 @@ You can also drag a deck file onto the window.
 
 Revealing a card's answer marks it seen. In `Unseen`, the card stays
 on screen until you move on. When every card has been seen, `Unseen`
-offers **Reset progress** (with a confirmation): seen marks are
+offers **Reset progress** (also available any time via **Reset…** next
+to the seen count, with a confirmation): seen marks are
 cleared, study-later flags are kept. The top bar shows how many cards
 you have seen (`seen / total`); the bottom bar shows the current
 card's place in the shown list.
