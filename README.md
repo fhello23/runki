@@ -42,10 +42,16 @@ You can also drag a deck file onto the window.
   Extra columns are appended to the back. A `front,back` header row is
   skipped.
 
-## Study-later list
+## Progress
 
-Flags are saved next to the deck in `<deck>.later.json` (card ids only),
-so they survive restarts. Delete that file to clear the list.
+Study-later flags and which cards you have seen (a card becomes seen
+when its answer is revealed) are saved next to the deck in
+`<deck>.runki.json`, so they survive restarts and sync with the deck.
+Delete that file to clear a deck's progress. A legacy
+`<deck>.later.json` from older versions is imported once into the new
+file and left in place. Editing a CSV row or renaming a deck file
+loses that card's / deck's progress, because progress is keyed by
+card id and deck file name.
 
 ## Limitations (by design, it is a plain viewer)
 

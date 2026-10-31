@@ -1,4 +1,5 @@
-//! Deck loading (`.apkg`, CSV, TSV) and study-later persistence.
+//! Deck loading (`.apkg`, CSV, TSV). Progress persistence lives in
+//! [`crate::progress`].
 //!
 //! An `.apkg` is a zip containing a SQLite database
 //! (`collection.anki21b`, `collection.anki21`, or `collection.anki2`;
@@ -7,7 +8,7 @@
 //! remaining fields are the back. HTML is stripped down to plain text.
 
 use std::collections::HashSet;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
@@ -283,60 +284,6 @@ pub fn parse_delimited(bytes: &[u8], delimiter: u8) -> Result<Vec<Card>> {
         cards.push(Card { id, front, back });
     }
     Ok(cards)
-}
-
-/// Path of the study-later sidecar file for a deck.
-pub fn later_path(deck_path: &Path) -> PathBuf {
-    // Append to the OsString so non-UTF-8 paths are kept exactly.
-    let mut os = deck_path.as_os_str().to_owned();
-    os.push(".later.json");
-    PathBuf::from(os)
-}
-
-/// Load flagged card ids for a deck; empty set if none saved yet.
-pub fn load_later(deck_path: &Path) -> Result<HashSet<String>> {
-    let path = later_path(deck_path);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(HashSet::new()),
-        Err(err) => {
-            return Err(err)
-                .with_context(|| format!("Could not read study-later list in {}", path.display()));
-        }
-    };
-    serde_json::from_str::<Vec<String>>(&text)
-        .map(|v| v.into_iter().collect())
-        .with_context(|| format!("Could not parse study-later list in {}", path.display()))
-}
-
-/// Save flagged card ids next to the deck file.
-pub fn save_later(deck_path: &Path, later: &HashSet<String>) -> Result<()> {
-    let mut ids: Vec<&String> = later.iter().collect();
-    ids.sort();
-    let text = serde_json::to_string_pretty(&ids)?;
-    let path = later_path(deck_path);
-    let mut tmp_path = path.clone().into_os_string();
-    tmp_path.push(".tmp");
-    let tmp_path = PathBuf::from(tmp_path);
-    // Write a temp file and rename it over the real one, so a crash
-    // mid-write can never leave a truncated list behind.
-    let result = (|| -> std::io::Result<()> {
-        let mut file = std::fs::File::create(&tmp_path)?;
-        file.write_all(text.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&tmp_path, &path)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp_path);
-    }
-    result.with_context(|| {
-        format!(
-            "Could not save study-later list next to {}",
-            deck_path.display()
-        )
-    })?;
-    Ok(())
 }
 
 /// Stable FNV-1a hash (the std hasher is not stable across runs/releases).

@@ -1,41 +1,42 @@
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 
-use runki::deck::{later_path, load_deck};
+use runki::deck::load_deck;
+use runki::progress::state_path;
 
 #[test]
-fn later_path_keeps_name_for_normal_paths() {
+fn state_path_keeps_name_for_normal_paths() {
     assert_eq!(
-        later_path(Path::new("/some/dir/deck.csv")),
-        PathBuf::from("/some/dir/deck.csv.later.json")
+        state_path(Path::new("/some/dir/deck.csv"), None),
+        PathBuf::from("/some/dir/deck.csv.runki.json")
     );
     assert_eq!(
-        later_path(Path::new("deck.apkg")),
-        PathBuf::from("deck.apkg.later.json")
+        state_path(Path::new("deck.apkg"), None),
+        PathBuf::from("deck.apkg.runki.json")
     );
     assert_eq!(
-        later_path(Path::new("no-extension")),
-        PathBuf::from("no-extension.later.json")
+        state_path(Path::new("no-extension"), None),
+        PathBuf::from("no-extension.runki.json")
     );
 }
 
 #[cfg(unix)]
 #[test]
-fn later_path_round_trips_non_utf8_name() {
+fn state_path_round_trips_non_utf8_name() {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
     let name = OsStr::from_bytes(b"deck-\xff.csv");
     let deck_path = Path::new("/tmp").join(name);
-    let result = later_path(&deck_path);
+    let result = state_path(&deck_path, None);
     assert_eq!(
         result.as_os_str().as_bytes(),
-        b"/tmp/deck-\xff.csv.later.json"
+        b"/tmp/deck-\xff.csv.runki.json"
     );
     // Round-trip: stripping the suffix gives back the original bytes.
     let bytes = result.as_os_str().as_bytes();
     assert_eq!(
-        &bytes[..bytes.len() - b".later.json".len()],
+        &bytes[..bytes.len() - b".runki.json".len()],
         deck_path.as_os_str().as_bytes()
     );
 }

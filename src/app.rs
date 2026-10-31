@@ -5,12 +5,16 @@
 //! - `L` toggles the current card in the study-later list.
 //! - The top bar switches between all cards and study-later only.
 
-use std::collections::HashSet;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
 use crate::deck::{self, Deck};
+use crate::progress::{self, DeckState, LoadOutcome};
+
+/// How often a dirty state is written while studying.
+const SAVE_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -24,11 +28,19 @@ pub struct RunkiApp {
     pos: usize,
     revealed: bool,
     mode: Mode,
-    later: HashSet<String>,
-    /// Set when the study-later file could not be read: toggles still
-    /// update `later` in memory but must not overwrite the file.
-    later_save_blocked: bool,
+    state: DeckState,
+    state_path: Option<PathBuf>,
+    /// Set when the progress file could not be read: changes still
+    /// update `state` in memory but must not overwrite the file.
+    save_blocked: bool,
+    /// `state` has unsaved changes.
+    dirty: bool,
+    last_save_attempt: Option<Instant>,
     error: Option<String>,
+    /// Error from the last save attempt; cleared by the next
+    /// successful save. Kept apart from `error` so a background save
+    /// never hides an unrelated message.
+    save_error: Option<String>,
 }
 
 impl RunkiApp {
@@ -38,9 +50,13 @@ impl RunkiApp {
             pos: 0,
             revealed: false,
             mode: Mode::All,
-            later: HashSet::new(),
-            later_save_blocked: false,
+            state: DeckState::new(),
+            state_path: None,
+            save_blocked: false,
+            dirty: false,
+            last_save_attempt: None,
             error: None,
+            save_error: None,
         };
         if let Some(path) = initial_deck {
             app.open_path(path);
@@ -51,22 +67,35 @@ impl RunkiApp {
     fn open_path(&mut self, path: PathBuf) {
         match deck::load_deck(&path) {
             Ok(deck) => {
-                match deck::load_later(&deck.path) {
-                    Ok(later) => {
-                        self.later = later;
-                        self.later_save_blocked = false;
-                        self.error = None;
-                    }
-                    Err(err) => {
-                        self.later = HashSet::new();
-                        self.later_save_blocked = true;
-                        self.error = Some(format!(
-                            "{err:#}. The study-later list could not be read, so \
-                             flags in this session won't be saved until the file \
-                             is fixed or removed."
-                        ));
-                    }
-                }
+                // Always save the outgoing deck's progress first, and
+                // say so if that failed: its unsaved changes are lost.
+                self.save_now();
+                let outgoing_error = self.save_error.take().map(|err| {
+                    let name = self.deck.as_ref().map_or("the previous deck", |d| &d.name);
+                    format!("Progress for {name} could not be saved: {err}")
+                });
+                let state_path = progress::state_path(&deck.path, None);
+                let outcome = progress::load(&deck.path, &state_path);
+                self.save_blocked = outcome.is_blocked();
+                let load_error = match &outcome {
+                    LoadOutcome::Blocked { error, .. } => Some(format!(
+                        "{error:#}. Progress could not be read, so \
+                         changes in this session won't be saved until the file \
+                         is fixed or removed."
+                    )),
+                    _ => None,
+                };
+                self.error = match (outgoing_error, load_error) {
+                    (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
+                    (a, b) => a.or(b),
+                };
+                // A migrated state only exists in memory until saved.
+                self.dirty = outcome.is_migrated();
+                self.state = outcome.into_state();
+                self.state_path = Some(state_path);
+                // Opening is itself a state change.
+                self.state.mark_opened(progress::now_ms());
+                self.dirty = true;
                 self.deck = Some(deck);
                 self.pos = 0;
                 self.revealed = false;
@@ -76,6 +105,57 @@ impl RunkiApp {
                 self.error = Some(format!("{err:#}"));
             }
         }
+    }
+
+    /// Save now if there is anything to save. Used on deck switch and
+    /// on exit; periodic saves go through the debounced path.
+    fn save_now(&mut self) {
+        self.save_now_at(Instant::now());
+    }
+
+    fn save_now_at(&mut self, now: Instant) {
+        if !self.dirty || self.save_blocked {
+            return;
+        }
+        let Some(state_path) = &self.state_path else {
+            return;
+        };
+        if self.deck.is_none() {
+            return;
+        }
+        self.last_save_attempt = Some(now);
+        match progress::save(state_path, &self.state) {
+            Ok(merged) => {
+                self.state = merged;
+                self.dirty = false;
+                self.save_error = None;
+            }
+            Err(err) => {
+                self.save_error = Some(format!("{err:#}"));
+            }
+        }
+    }
+
+    /// Save if dirty and at least [`SAVE_INTERVAL`] has passed since
+    /// the last save attempt. Returns how long until the next attempt
+    /// is due, so the caller can schedule a repaint for it.
+    fn maybe_save_debounced_at(&mut self, now: Instant) -> Option<Duration> {
+        if !self.dirty || self.save_blocked {
+            return None;
+        }
+        let due = self
+            .last_save_attempt
+            .is_none_or(|last| now.saturating_duration_since(last) >= SAVE_INTERVAL);
+        if due {
+            self.save_now_at(now);
+        }
+        // Still dirty (not due yet, or the save failed): next attempt
+        // is due one interval after the last one.
+        self.dirty.then(|| {
+            self.last_save_attempt
+                .map(|last| (last + SAVE_INTERVAL).saturating_duration_since(now))
+                .unwrap_or(Duration::ZERO)
+        })
     }
 
     fn pick_and_open(&mut self) {
@@ -95,7 +175,7 @@ impl RunkiApp {
         deck.cards
             .iter()
             .enumerate()
-            .filter(|(_, card)| self.later.contains(&card.id))
+            .filter(|(_, card)| self.state.is_later(&card.id))
             .map(|(i, _)| i)
             .collect()
     }
@@ -127,6 +207,7 @@ impl RunkiApp {
     }
 
     /// Space: reveal the answer, or advance (wrapping) if already shown.
+    /// Revealing marks the card seen.
     fn space(&mut self) {
         let view_len = self.view_len();
         if view_len == 0 {
@@ -136,26 +217,23 @@ impl RunkiApp {
             self.pos = (self.pos + 1) % view_len;
             self.revealed = false;
         } else {
+            if let Some(card_id) = self.current().map(|(card, _, _)| card.id.clone()) {
+                self.state.mark_seen(&card_id, progress::now_ms());
+                self.dirty = true;
+            }
             self.revealed = true;
         }
     }
 
-    /// L: toggle the current card in the study-later list and save.
+    /// L: toggle the current card in the study-later list.
+    /// The change is saved by the debounced saver.
     fn toggle_later(&mut self) {
         let Some(card_id) = self.current().map(|(card, _, _)| card.id.clone()) else {
             return;
         };
-        if !self.later.insert(card_id.clone()) {
-            self.later.remove(&card_id);
-        }
-        if !self.later_save_blocked {
-            if let Some(deck) = &self.deck {
-                match deck::save_later(&deck.path, &self.later) {
-                    Ok(()) => self.error = None,
-                    Err(err) => self.error = Some(format!("{err:#}")),
-                }
-            }
-        }
+        let on = !self.state.is_later(&card_id);
+        self.state.set_later(&card_id, on, progress::now_ms());
+        self.dirty = true;
         // Unflagging while reviewing the later list shrinks the view;
         // keep the position pointing at the next remaining card.
         let view_len = self.view_len();
@@ -171,15 +249,13 @@ impl RunkiApp {
     }
 
     /// Number of cards in the open deck that are flagged for later.
-    /// Stale ids matching no card are ignored (but kept in `later`).
+    /// Stale ids matching no card are ignored (but kept in the state).
     fn later_count(&self) -> usize {
         let Some(deck) = &self.deck else {
             return 0;
         };
-        deck.cards
-            .iter()
-            .filter(|card| self.later.contains(&card.id))
-            .count()
+        self.state
+            .later_count(deck.cards.iter().map(|card| card.id.as_str()))
     }
 
     fn set_mode(&mut self, mode: Mode) {
@@ -192,6 +268,10 @@ impl RunkiApp {
 }
 
 impl eframe::App for RunkiApp {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.save_now();
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Drag-and-drop a deck file onto the window to open it.
         let dropped = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
@@ -208,6 +288,12 @@ impl eframe::App for RunkiApp {
         }
         if later_key {
             self.toggle_later();
+        }
+
+        // Debounced save, with a repaint scheduled so a pending save
+        // happens even without further input.
+        if let Some(delay) = self.maybe_save_debounced_at(Instant::now()) {
+            ctx.request_repaint_after(delay);
         }
 
         self.top_bar(ctx);
@@ -255,7 +341,7 @@ impl RunkiApp {
     fn bottom_bar(&mut self, ctx: &egui::Context) {
         let current = self
             .current()
-            .map(|(card, n, total)| (self.later.contains(&card.id), n, total));
+            .map(|(card, n, total)| (self.state.is_later(&card.id), n, total));
         egui::TopBottomPanel::bottom("bottom").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.add_enabled_ui(current.is_some(), |ui| {
@@ -293,15 +379,17 @@ impl RunkiApp {
 
     fn central(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            if let Some(error) = self.error.clone() {
-                ui.add_space(16.0);
-                ui.horizontal(|ui| {
-                    ui.colored_label(egui::Color32::LIGHT_RED, error);
-                    if ui.small_button("×").clicked() {
-                        self.error = None;
-                    }
-                });
-                ui.add_space(16.0);
+            for slot in [&mut self.error, &mut self.save_error] {
+                if let Some(error) = slot.clone() {
+                    ui.add_space(16.0);
+                    ui.horizontal(|ui| {
+                        ui.colored_label(egui::Color32::LIGHT_RED, error);
+                        if ui.small_button("×").clicked() {
+                            *slot = None;
+                        }
+                    });
+                    ui.add_space(16.0);
+                }
             }
 
             let Some(current) = self.current() else {
@@ -337,7 +425,7 @@ impl RunkiApp {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.add_space(24.0);
                 ui.vertical_centered(|ui| {
-                    if self.later.contains(&card.id) {
+                    if self.state.is_later(&card.id) {
                         ui.small("STUDY LATER");
                         ui.add_space(8.0);
                     }
@@ -387,18 +475,28 @@ mod tests {
                 back: format!("back {id}"),
             })
             .collect();
+        let deck_path = dir.join("deck.csv");
+        let mut state = DeckState::new();
+        for id in later {
+            state.set_later(id, true, 0);
+        }
+        let state_path = progress::state_path(&deck_path, None);
         let app = RunkiApp {
             deck: Some(Deck {
                 name: "test".to_string(),
-                path: dir.join("deck.csv"),
+                path: deck_path,
                 cards,
             }),
             pos,
             revealed,
             mode,
-            later: later.iter().map(|id| (*id).to_string()).collect(),
-            later_save_blocked: false,
+            state,
+            state_path: Some(state_path),
+            save_blocked: false,
+            dirty: false,
+            last_save_attempt: None,
             error: None,
+            save_error: None,
         };
         (app, guard)
     }
@@ -457,9 +555,9 @@ mod tests {
         );
 
         assert_eq!(app.later_count(), 1);
-        // Stale ids are not deleted from the in-memory set (or file).
-        assert_eq!(app.later.len(), 3);
-        assert!(app.later.contains("stale-1"));
+        // Stale ids are not deleted from the in-memory state (or file).
+        assert_eq!(app.state.later.len(), 3);
+        assert!(app.state.is_later("stale-1"));
     }
 
     #[test]
@@ -467,15 +565,52 @@ mod tests {
         let (mut app, _temp) = test_app("error-cleared-on-save", &[], Mode::All, 0, false);
         // Make the first save fail by occupying the sidecar path with a dir.
         let deck_path = app.deck.as_ref().expect("deck").path.clone();
-        let sidecar = deck::later_path(&deck_path);
+        let sidecar = progress::state_path(&deck_path, None);
         std::fs::create_dir_all(&sidecar).expect("create blocking dir");
 
         app.toggle_later();
-        assert!(app.error.is_some(), "failed save should set error");
+        app.save_now();
+        assert!(app.save_error.is_some(), "failed save should set error");
+        assert!(app.dirty, "failed save stays dirty for a retry");
 
         std::fs::remove_dir_all(&sidecar).expect("remove blocking dir");
         app.toggle_later();
-        assert_eq!(app.error, None, "successful save should clear error");
+        app.save_now();
+        assert_eq!(app.save_error, None, "successful save should clear error");
+        assert!(!app.dirty);
+    }
+
+    #[test]
+    fn successful_save_keeps_unrelated_error() {
+        let (mut app, _temp) = test_app("save-keeps-error", &[], Mode::All, 0, false);
+        app.error = Some("Could not open other.apkg".to_string());
+
+        app.toggle_later();
+        app.save_now();
+
+        assert!(!app.dirty);
+        assert_eq!(app.error.as_deref(), Some("Could not open other.apkg"));
+    }
+
+    #[test]
+    fn failed_save_on_deck_switch_is_reported() {
+        let (mut app, temp) = test_app("switch-save-fails", &[], Mode::All, 0, false);
+        let deck_path = app.deck.as_ref().expect("deck").path.clone();
+        // Make saving the outgoing deck fail.
+        std::fs::create_dir_all(progress::state_path(&deck_path, None))
+            .expect("create blocking dir");
+        app.toggle_later();
+        let next = temp.0.join("next.tsv");
+        std::fs::write(&next, "Q\tA\n").expect("write next deck");
+
+        app.open_path(next);
+
+        let error = app.error.as_deref().expect("lost progress is reported");
+        assert!(
+            error.contains("Progress for test could not be saved"),
+            "{error}"
+        );
+        assert_eq!(app.save_error, None);
     }
 
     #[test]
@@ -485,16 +620,91 @@ mod tests {
         app.toggle_later();
 
         assert!(app.revealed);
-        assert!(app.later.contains("a"));
+        assert!(app.state.is_later("a"));
         let (card, _, _) = app.current().expect("card shown");
         assert_eq!(card.id, "a");
 
         app.toggle_later();
 
         assert!(app.revealed);
-        assert!(!app.later.contains("a"));
+        assert!(!app.state.is_later("a"));
         let (card, _, _) = app.current().expect("card shown");
         assert_eq!(card.id, "a");
+    }
+
+    #[test]
+    fn reveal_marks_card_seen() {
+        let (mut app, _temp) = test_app("reveal-marks-seen", &[], Mode::All, 0, false);
+        assert!(!app.state.is_seen("a"));
+
+        app.space();
+
+        assert!(app.revealed);
+        assert!(app.state.is_seen("a"), "revealing marks the card seen");
+        assert!(app.dirty);
+
+        // Advancing does not mark the next card.
+        app.space();
+        assert!(!app.revealed);
+        assert!(!app.state.is_seen("b"));
+    }
+
+    #[test]
+    fn debounced_save_writes_file() {
+        let (mut app, _temp) = test_app("debounced-save", &[], Mode::All, 0, false);
+        let state_path = app.state_path.clone().expect("state path");
+        assert!(!state_path.exists());
+
+        // First save attempt is immediate (nothing attempted yet).
+        let now = Instant::now();
+        app.toggle_later();
+        assert_eq!(app.maybe_save_debounced_at(now), None);
+        assert!(state_path.exists(), "debounced save writes the file");
+        assert!(!app.dirty);
+
+        // A new change inside the interval waits, then saves once due.
+        app.toggle_later();
+        let delay = app
+            .maybe_save_debounced_at(now + Duration::from_secs(1))
+            .expect("pending save should schedule a retry");
+        assert_eq!(delay, Duration::from_secs(1));
+        assert!(app.dirty);
+        app.maybe_save_debounced_at(now + Duration::from_secs(2));
+        assert!(!app.dirty);
+        let loaded = progress::load(&app.deck.as_ref().expect("deck").path, &state_path);
+        assert!(!loaded.state().is_later("a"), "second toggle was saved");
+    }
+
+    #[test]
+    fn switching_decks_saves_outgoing_deck() {
+        let dir =
+            std::env::temp_dir().join(format!("runki-test-switch-saves-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let first = dir.join("first.tsv");
+        std::fs::write(&first, "Q1\tA1\n").expect("write first deck");
+        let second = dir.join("second.tsv");
+        std::fs::write(&second, "Q2\tA2\n").expect("write second deck");
+
+        let mut app = RunkiApp::new(Some(first.clone()));
+        assert!(app.state.opened_at > 0, "opening stamps opened_at");
+        app.space();
+        app.open_path(second);
+
+        let first_state = progress::state_path(&first, None);
+        assert!(first_state.exists(), "switching saved the first deck");
+        let loaded = progress::load(&first, &first_state);
+        assert_eq!(
+            loaded.state().seen_count(["x"].into_iter()),
+            0,
+            "sanity: unknown ids are not seen"
+        );
+        assert!(
+            loaded.state().seen.values().any(|&t| t > 0),
+            "seen mark was saved on switch"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -508,12 +718,14 @@ mod tests {
         let deck_path = dir.join("deck.tsv");
         std::fs::write(&deck_path, "Q1\tA1\nQ2\tA2\n").expect("write deck");
         let corrupt = "not valid json {{{";
-        let sidecar = crate::deck::later_path(&deck_path);
-        std::fs::write(&sidecar, corrupt).expect("write corrupt sidecar");
+        // Legacy sidecar: a corrupt one blocks saving (migration path).
+        let legacy = dir.join("deck.tsv.later.json");
+        std::fs::write(&legacy, corrupt).expect("write corrupt legacy file");
+        let state_path = progress::state_path(&deck_path, None);
 
         let mut app = RunkiApp::new(Some(deck_path));
         assert!(app.deck.is_some(), "deck still opens");
-        assert!(app.later_save_blocked);
+        assert!(app.save_blocked);
         assert!(
             app.error
                 .as_deref()
@@ -523,12 +735,49 @@ mod tests {
         );
 
         app.toggle_later();
+        app.save_now();
 
-        assert_eq!(app.later.len(), 1, "toggle still updates in-memory list");
         assert_eq!(
-            std::fs::read_to_string(&sidecar).expect("read sidecar"),
+            app.state.later.len(),
+            1,
+            "toggle still updates in-memory state"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&legacy).expect("read legacy file"),
             corrupt,
             "corrupt file must be unchanged on disk"
+        );
+        assert!(!state_path.exists(), "blocked save never writes state");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_state_file_is_not_overwritten() {
+        let dir = std::env::temp_dir().join(format!(
+            "runki-test-corrupt-state-toggle-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let deck_path = dir.join("deck.tsv");
+        std::fs::write(&deck_path, "Q1\tA1\n").expect("write deck");
+        let corrupt = "not valid json {{{";
+        let state_path = progress::state_path(&deck_path, None);
+        std::fs::write(&state_path, corrupt).expect("write corrupt state");
+
+        let mut app = RunkiApp::new(Some(deck_path));
+        assert!(app.save_blocked);
+
+        app.toggle_later();
+        app.space();
+        app.save_now();
+        app.maybe_save_debounced_at(Instant::now());
+
+        assert_eq!(
+            std::fs::read_to_string(&state_path).expect("read state"),
+            corrupt,
+            "blocked save must leave the file untouched"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -544,22 +793,23 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let bad_path = dir.join("bad.tsv");
         std::fs::write(&bad_path, "Q1\tA1\n").expect("write bad deck");
-        std::fs::write(crate::deck::later_path(&bad_path), "not valid json {{{")
-            .expect("write corrupt sidecar");
+        std::fs::write(dir.join("bad.tsv.later.json"), "not valid json {{{")
+            .expect("write corrupt legacy file");
         let good_path = dir.join("good.tsv");
         std::fs::write(&good_path, "Q1\tA1\n").expect("write good deck");
 
         let mut app = RunkiApp::new(Some(bad_path));
-        assert!(app.later_save_blocked);
+        assert!(app.save_blocked);
 
         app.open_path(good_path.clone());
-        assert!(!app.later_save_blocked);
+        assert!(!app.save_blocked);
         assert!(app.error.is_none());
 
         app.toggle_later();
+        app.save_now();
         assert!(
-            crate::deck::later_path(&good_path).exists(),
-            "toggle saves after the flag is reset"
+            progress::state_path(&good_path, None).exists(),
+            "save works after the flag is reset"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
