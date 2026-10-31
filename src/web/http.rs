@@ -97,6 +97,17 @@ fn bad(message: &str) -> Response {
     Response::error(400, message)
 }
 
+fn set_once<'a>(
+    slot: &mut Option<&'a str>,
+    value: &'a str,
+    duplicate_message: &str,
+) -> Result<(), Response> {
+    if slot.replace(value).is_some() {
+        return Err(bad(duplicate_message));
+    }
+    Ok(())
+}
+
 fn read_request(
     stream: &mut TcpStream,
     shutdown: &AtomicBool,
@@ -168,26 +179,10 @@ fn read_request(
                         .map_err(|_| bad("Invalid Content-Length"))?,
                 );
             }
-            "host" => {
-                if host.replace(value).is_some() {
-                    return Err(bad("Duplicate Host"));
-                }
-            }
-            "origin" => {
-                if origin.replace(value).is_some() {
-                    return Err(bad("Duplicate Origin"));
-                }
-            }
-            "content-type" => {
-                if content_type.replace(value).is_some() {
-                    return Err(bad("Duplicate Content-Type"));
-                }
-            }
-            "sec-fetch-site" => {
-                if fetch_site.replace(value).is_some() {
-                    return Err(bad("Duplicate Sec-Fetch-Site"));
-                }
-            }
+            "host" => set_once(&mut host, value, "Duplicate Host")?,
+            "origin" => set_once(&mut origin, value, "Duplicate Origin")?,
+            "content-type" => set_once(&mut content_type, value, "Duplicate Content-Type")?,
+            "sec-fetch-site" => set_once(&mut fetch_site, value, "Duplicate Sec-Fetch-Site")?,
             _ => {}
         }
     }
