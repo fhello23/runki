@@ -364,7 +364,10 @@ fn load_legacy(deck_path: &Path) -> LoadOutcome {
 
 /// Read and parse a state file: `None` if it does not exist yet,
 /// `Err` if it is unreadable, invalid, or from a newer version.
-fn read_state_file(path: &Path) -> Result<Option<DeckState>> {
+/// Crate-visible so the library can parse sync conflict copies
+/// without going through deck-oriented [`load`] (which would try
+/// legacy migration for a missing file).
+pub(crate) fn read_state_file(path: &Path) -> Result<Option<DeckState>> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),

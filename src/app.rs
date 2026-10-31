@@ -43,6 +43,18 @@ pub struct Config {
     pub last_open_deck: Option<PathBuf>,
 }
 
+/// Reveal a not-downloaded deck in Finder (`open -R`), pointing at
+/// the real file if it exists and at its iCloud placeholder
+/// otherwise, so the user can download it there. Best-effort: a
+/// failed spawn is ignored. macOS only; other OSes hide the button.
+#[cfg(target_os = "macos")]
+fn show_in_finder(real_path: &std::path::Path) {
+    let _ = std::process::Command::new("open")
+        .arg("-R")
+        .arg(library::reveal_path(real_path))
+        .spawn();
+}
+
 /// Which screen is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -239,12 +251,9 @@ impl RunkiApp {
     /// it exists (it is created on the first frame).
     fn start_loader(&self) {
         if let (Some(loader), Some(dir)) = (&self.loader, &self.config.library) {
-            let paths = self
-                .library_entries
-                .iter()
-                .map(|entry| entry.path.clone())
-                .collect();
-            loader.start(dir, paths);
+            // Not-downloaded rows are never sent to the loader:
+            // reading one would block on a cloud download.
+            loader.start(dir, library::loadable_paths(&self.library_entries));
         }
     }
 
@@ -676,7 +685,11 @@ impl RunkiApp {
             for entry in &self.library_entries {
                 let ready = matches!(entry.status, DeckStatus::Ready { .. });
                 let row = ui.horizontal_wrapped(|ui| {
-                    ui.strong(&entry.display_name);
+                    if entry.status == DeckStatus::NotDownloaded {
+                        ui.weak(&entry.display_name);
+                    } else {
+                        ui.strong(&entry.display_name);
+                    }
                     match &entry.status {
                         DeckStatus::Loading => {
                             ui.spinner();
@@ -705,6 +718,10 @@ impl RunkiApp {
                         }
                         DeckStatus::NotDownloaded => {
                             ui.weak("Not downloaded – open in Finder to download");
+                            #[cfg(target_os = "macos")]
+                            if ui.small_button("Show in Finder").clicked() {
+                                show_in_finder(&entry.path);
+                            }
                         }
                     }
                 });
@@ -1211,13 +1228,17 @@ mod tests {
         assert_eq!(app.screen(), Screen::Library);
         assert!(app.session.is_none());
         assert_eq!(app.library_entries.len(), 1, "rescanned on the way back");
-        assert!(
-            app.library_entries[0].opened_at > 0,
-            "rescan picked up the saved opened_at"
+        assert_eq!(
+            app.library_entries[0].opened_at, 0,
+            "scan no longer reads state; the loader supplies opened_at"
         );
         let saved = progress::load(
             &deck_path,
             &progress::state_path(&deck_path, Some(&library)),
+        );
+        assert!(
+            saved.state().opened_at > 0,
+            "the saved opened_at is on disk for the loader to report"
         );
         assert!(
             saved.state().seen.values().any(|&t| t > 0),
