@@ -8,6 +8,7 @@ mod about_macos;
 use runki::config;
 #[cfg(feature = "gui")]
 use runki::config::Config;
+use runki::web::WebOptions;
 use runki::VERSION;
 
 const USAGE: &str = "\
@@ -19,6 +20,9 @@ The desktop interface is the default; terminal-only builds use the TUI.
 Options:
   -t, --tui          Run the full terminal interface
       --library DIR Use this library folder (remembered for both interfaces)
+      --web         Enable LAN study for this run (no login)
+      --no-web      Disable LAN study for this run
+      --web-port N  Use port 1..=65535 for this run (default: 8765)
   -h, --help         Print this help
   -V, --version      Print the version
       --            Treat remaining arguments as a deck path
@@ -31,6 +35,7 @@ enum Command {
         tui: bool,
         deck: Option<PathBuf>,
         library: Option<PathBuf>,
+        web: WebOptions,
     },
     Version,
     Help,
@@ -42,6 +47,7 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Command, String> {
     let mut deck = None;
     let mut library = None;
     let mut positional = false;
+    let mut web = WebOptions::default();
     while let Some(arg) = args.next() {
         if !positional {
             match arg.to_str() {
@@ -49,6 +55,30 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Command, String> {
                 Some("-h" | "--help") => return Ok(Command::Help),
                 Some("-t" | "--tui") => {
                     tui = true;
+                    continue;
+                }
+                Some("--web" | "--no-web") => {
+                    if web.on.is_some() {
+                        return Err("--web / --no-web was given twice".into());
+                    }
+                    web.on = Some(arg == "--web");
+                    continue;
+                }
+                Some("--web-port") => {
+                    if web.port.is_some() {
+                        return Err("--web-port was given twice".into());
+                    }
+                    let value = args.next().ok_or("--web-port needs a port (1..=65535)")?;
+                    let port = value
+                        .to_str()
+                        .and_then(|s| {
+                            if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+                                return None;
+                            }
+                            s.parse::<u16>().ok().filter(|&port| port != 0)
+                        })
+                        .ok_or("--web-port needs a port (1..=65535)")?;
+                    web.port = Some(port);
                     continue;
                 }
                 Some("--library") => {
@@ -80,7 +110,12 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Command, String> {
         }
         deck = Some(PathBuf::from(arg));
     }
-    Ok(Command::Run { tui, deck, library })
+    Ok(Command::Run {
+        tui,
+        deck,
+        library,
+        web,
+    })
 }
 
 fn main() -> ExitCode {
@@ -91,8 +126,13 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let (tui, deck, library) = match command {
-        Command::Run { tui, deck, library } => (tui, deck, library),
+    let (tui, deck, library, web) = match command {
+        Command::Run {
+            tui,
+            deck,
+            library,
+            web,
+        } => (tui, deck, library, web),
         Command::Version => {
             println!("runki {VERSION}");
             return ExitCode::SUCCESS;
@@ -102,7 +142,7 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
     };
-    match run(tui, deck, library) {
+    match run(tui, deck, library, web) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("runki: {error:#}");
@@ -111,7 +151,12 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(tui: bool, deck: Option<PathBuf>, library: Option<PathBuf>) -> anyhow::Result<()> {
+fn run(
+    tui: bool,
+    deck: Option<PathBuf>,
+    library: Option<PathBuf>,
+    web: WebOptions,
+) -> anyhow::Result<()> {
     if let Some(dir) = &library {
         anyhow::ensure!(
             dir.is_dir(),
@@ -130,10 +175,10 @@ fn run(tui: bool, deck: Option<PathBuf>, library: Option<PathBuf>) -> anyhow::Re
         if let Some(dir) = library {
             config.library = Some(dir);
         }
-        return runki::tui::run(config, path, deck);
+        return runki::tui::run(config, path, deck, web);
     }
     #[cfg(feature = "gui")]
-    run_gui(deck, shared_config, library, path).map_err(|err| anyhow::anyhow!("{err}"))?;
+    run_gui(deck, shared_config, library, path, web).map_err(|err| anyhow::anyhow!("{err}"))?;
     Ok(())
 }
 
@@ -143,6 +188,7 @@ fn run_gui(
     shared_config: Option<Config>,
     library: Option<PathBuf>,
     config_path: PathBuf,
+    web: WebOptions,
 ) -> eframe::Result<()> {
     use runki::app::{RunkiApp, CONFIG_KEY};
     use runki::theme;
@@ -167,8 +213,10 @@ fn run_gui(
         "Runki",
         options,
         Box::new(move |cc| {
+            let web_bridge = std::sync::Arc::new(runki::web_menu::WebMenuBridge::default());
+            web_bridge.set_context(cc.egui_ctx.clone());
             #[cfg(target_os = "macos")]
-            about_macos::install();
+            about_macos::install(std::sync::Arc::clone(&web_bridge));
             theme::install(&cc.egui_ctx);
             let choice = theme::load(cc.storage);
             cc.egui_ctx.set_theme(choice);
@@ -183,7 +231,8 @@ fn run_gui(
                 config.library = Some(dir);
             }
             Ok(Box::new(
-                RunkiApp::new(config, initial_deck)
+                RunkiApp::new_with_web_options(config, initial_deck, web)
+                    .with_web_bridge(web_bridge)
                     .with_theme(choice)
                     .with_config_path(config_path),
             ))
@@ -205,6 +254,7 @@ mod tests {
             tui: !cfg!(feature = "gui"),
             deck: None,
             library: None,
+            web: WebOptions::default(),
         };
         assert_eq!(parse(&[]), Ok(expected));
         assert_eq!(parse(&["-psn_0_12345"]), parse(&[]));
@@ -216,6 +266,7 @@ mod tests {
             tui: true,
             deck: Some("deck.apkg".into()),
             library: Some("my decks".into()),
+            web: WebOptions::default(),
         };
         assert_eq!(
             parse(&["--tui", "--library", "my decks", "deck.apkg"]),
@@ -246,6 +297,39 @@ mod tests {
             &["--library", "a", "--library", "b"],
         ] {
             assert!(parse(args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn web_flags_and_port_validation() {
+        for (args, on, port) in [
+            (vec!["--web"], Some(true), None),
+            (vec!["--no-web"], Some(false), None),
+            (vec!["--web-port", "1", "--web"], Some(true), Some(1)),
+            (
+                vec!["--no-web", "--web-port", "65535"],
+                Some(false),
+                Some(65535),
+            ),
+            (vec!["--web-port", "8765"], None, Some(8765)),
+        ] {
+            assert!(
+                matches!(parse(&args), Ok(Command::Run { web, .. }) if web == WebOptions { on, port })
+            );
+        }
+        for args in [
+            vec!["--web-port"],
+            vec!["--web-port", "0"],
+            vec!["--web-port", "65536"],
+            vec!["--web-port", "no"],
+            vec!["--web-port", "-1"],
+            vec!["--web-port", ""],
+            vec!["--web", "--web"],
+            vec!["--no-web", "--no-web"],
+            vec!["--web", "--no-web"],
+            vec!["--web-port", "1", "--web-port", "2"],
+        ] {
+            assert!(parse(&args).is_err(), "{args:?}");
         }
     }
 

@@ -11,6 +11,14 @@ see. Releasing moves those lines under the new version (see
 
 ## [Unreleased]
 
+### Added
+
+- Optional LAN web study interface, controlled from both desktop screens,
+  the macOS Runki menu, or TUI `w`, with an editable remembered port and
+  temporary `--web` / `--no-web` / `--web-port` overrides.
+- Browser library and full study controls sharing the existing progress files;
+  no login, so anyone on the network can study and change progress.
+
 ## [0.3.5] - 2026-10-31
 
 ### Added

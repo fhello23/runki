@@ -4,6 +4,7 @@ mod ui;
 
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -16,6 +17,7 @@ use crate::deck;
 use crate::library::{self, DeckEntry, LibraryLoader};
 use crate::progress::{self, CardFilter, CardOrder};
 use crate::session::StudySession;
+use crate::web::{LibrarySlot, WebOptions, WebServer, WARNING};
 
 const SAVE_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -44,6 +46,10 @@ enum Dialog {
 }
 
 struct App {
+    library_slot: LibrarySlot,
+    web: Option<WebServer>,
+    web_port: u16,
+    web_error: Option<String>,
     config: Config,
     config_path: PathBuf,
     entries: Vec<DeckEntry>,
@@ -64,9 +70,19 @@ struct App {
 }
 
 impl App {
+    #[cfg(test)]
     fn new(config: Config, config_path: PathBuf) -> Self {
+        Self::new_with_web_options(config, config_path, WebOptions::default())
+    }
+
+    fn new_with_web_options(config: Config, config_path: PathBuf, options: WebOptions) -> Self {
+        let web_on = options.on.unwrap_or(config.web_on);
         let light = config.terminal_light;
         let mut app = Self {
+            library_slot: Arc::new(RwLock::new(config.library.clone())),
+            web: None,
+            web_port: options.port.unwrap_or(config.web_port),
+            web_error: None,
             config,
             config_path,
             entries: Vec::new(),
@@ -85,8 +101,36 @@ impl App {
             light,
             quit: false,
         };
+        if web_on {
+            app.start_web();
+        }
         app.rescan();
         app
+    }
+
+    fn start_web(&mut self) {
+        match WebServer::start(Arc::clone(&self.library_slot), self.web_port) {
+            Ok(server) => {
+                self.notice = Some(format!(
+                    "Web: {} (local: {})\n{WARNING}",
+                    server.lan_url(),
+                    server.localhost_url()
+                ));
+                self.web = Some(server);
+                self.web_error = None;
+            }
+            Err(err) => self.web_error = Some(format!("Web: {err:#}")),
+        }
+    }
+
+    fn toggle_web(&mut self) {
+        if let Some(mut server) = self.web.take() {
+            self.web_error = server.stop().err().map(|err| format!("Web: {err:#}"));
+        } else {
+            self.start_web();
+        }
+        self.config.web_on = self.web.is_some();
+        self.persist_config();
     }
 
     fn persist_config(&mut self) {
@@ -254,6 +298,7 @@ impl App {
                 std::fs::create_dir_all(&path)
                     .with_context(|| format!("Could not create {}", path.display()))?;
                 self.config.library = Some(std::fs::canonicalize(path)?);
+                *self.library_slot.write().expect("library slot") = self.config.library.clone();
                 self.session = None;
                 self.persist_config();
                 self.rescan();
@@ -437,11 +482,13 @@ impl App {
                     .as_ref()
                     .or(self.error.as_ref())
                     .or(self.notice.as_ref())
+                    .or(self.web_error.as_ref())
                 {
                     self.dialog_scroll = 0;
                     self.dialog = Some(Dialog::Message(message.clone()));
                 }
             }
+            KeyCode::Char('w') => self.toggle_web(),
             KeyCode::Char('t') => {
                 self.light = !self.light;
                 self.config.terminal_light = self.light;
@@ -569,11 +616,16 @@ impl Drop for RestoreTerminal {
     }
 }
 
-pub fn run(config: Config, config_path: PathBuf, initial_deck: Option<PathBuf>) -> Result<()> {
+pub fn run(
+    config: Config,
+    config_path: PathBuf,
+    initial_deck: Option<PathBuf>,
+    web: WebOptions,
+) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         bail!("The terminal interface needs an interactive terminal on stdin and stdout. Run runki --tui in a terminal without piping or redirection.");
     }
-    let mut app = App::new(config, config_path);
+    let mut app = App::new_with_web_options(config, config_path, web);
     if let Some(path) = initial_deck {
         app.open(path)?;
     }
@@ -586,6 +638,11 @@ pub fn run(config: Config, config_path: PathBuf, initial_deck: Option<PathBuf>) 
     if !app.quit {
         app.save()
             .context("Could not save progress while closing the terminal interface")?;
+    }
+    if let Some(mut server) = app.web.take() {
+        server
+            .stop()
+            .context("Could not save Web progress while closing the terminal interface")?;
     }
     result
 }

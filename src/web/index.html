@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Runki</title>
+<style>
+:root{color-scheme:light dark;--bg:#f5f4f0;--panel:#fff;--fg:#252822;--muted:#64685e;--line:#d7dbd0;--accent:#376044;--active:#e0efdf;--error:#8b2424;--warn:#fff2d2}
+@media(prefers-color-scheme:dark){:root{--bg:#171b18;--panel:#222923;--fg:#e8eee7;--muted:#aeb8ac;--line:#475346;--accent:#aad2aa;--active:#304a35;--error:#ffb3ac;--warn:#44391e}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:17px/1.5 system-ui,sans-serif}main{max-width:760px;margin:auto;padding:18px}header,.row{display:flex;align-items:center;gap:12px;flex-wrap:wrap}header{justify-content:space-between}h1{font-size:24px;margin:0}h2{font-size:22px;overflow-wrap:anywhere}p{overflow-wrap:anywhere}.muted{color:var(--muted);font-size:14px}button,select{font:inherit;color:inherit;border:1px solid var(--line);border-radius:10px;background:var(--panel);min-height:48px;padding:10px 14px;cursor:pointer;max-width:100%}button:hover{border-color:var(--accent)}button:focus-visible,select:focus-visible{outline:3px solid var(--accent);outline-offset:3px}button:disabled{opacity:.6;cursor:default}.active{background:var(--active);border-color:var(--accent)}.primary{font-weight:650;flex:1;border-color:var(--accent)}[hidden]{display:none!important}.banner{border-radius:10px;padding:12px;margin:14px 0;background:var(--warn);white-space:pre-wrap}.error{color:var(--error);border:1px solid currentColor}.decks{display:grid;gap:12px;margin:18px 0}.deck{width:100%;text-align:left;white-space:pre-wrap;overflow-wrap:anywhere}.deck strong,.deck small{display:block}.deck small{color:var(--muted);font-size:14px}.card{display:block;width:100%;text-align:left;padding:24px;min-height:260px;margin:18px 0;overflow-wrap:anywhere;white-space:pre-wrap}.front{font-size:23px}.back{display:block;border-top:1px solid var(--line);padding-top:22px;margin-top:22px}label{display:grid;gap:6px;flex:1;min-width:130px;font-size:14px}.controls{display:grid;gap:16px}#counts,#position{color:var(--muted)}#reset{margin-top:20px}#busy{font-size:14px;color:var(--muted)}
+</style>
+</head>
+<body>
+<main>
+<header><h1>Runki <span id="version" class="muted"></span></h1><span id="busy" role="status" aria-live="polite"></span></header>
+<p class="muted">Anyone on this network can study and change progress.</p>
+<div id="error" class="banner error" role="alert" hidden></div>
+<section id="library">
+<div class="row"><h2>Library</h2><button id="refresh">Refresh</button></div>
+<p id="folder" class="muted"></p>
+<p id="library-message" role="status"></p>
+<div id="decks" class="decks"></div>
+</section>
+<section id="study" hidden>
+<div class="row"><button id="close">Library</button><h2 id="deck-name"></h2></div>
+<div id="save-warning" class="banner" role="status" hidden>Progress could not be read. Changes in this session cannot be saved. Fix or download the progress file in Runki's library folder, then reopen the deck.</div>
+<p id="position"></p>
+<button id="card" class="card" aria-label="Reveal answer or advance to next card"><span id="front" class="front"></span><span id="back" class="back" hidden></span></button>
+<p id="empty" role="status" hidden></p>
+<div class="controls">
+<div class="row"><button id="space" class="primary">Reveal</button><button id="later" aria-pressed="false">Later</button></div>
+<div class="row"><label>Order<select id="order"><option value="deck">Deck order</option><option value="shuffled">Shuffled</option></select></label><button id="reshuffle">Reshuffle</button></div>
+<label>Show<select id="filter"><option value="all">All</option><option value="unseen">Unseen</option><option value="later">Later</option></select></label>
+</div>
+<p id="counts"></p>
+<button id="reset">Reset progress…</button>
+<p class="muted">Keys: Space reveal/next · L later · 1 / 2 / 3 filter</p>
+</section>
+<noscript>Enable JavaScript to study with Runki.</noscript>
+</main>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+let session = null;
+let busy = false;
+async function api(path, body) {
+  const options = body === undefined ? {} : {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)};
+  const response = await fetch('/api/' + path, options);
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || 'Request failed (' + response.status + ')');
+  return data;
+}
+function error(message) { $('error').textContent = message; $('error').hidden = !message; }
+async function action(work) {
+  if (busy) return;
+  busy = true;
+  $('busy').textContent = 'Loading…';
+  error('');
+  try { await work(); }
+  catch (err) { error(err.message || 'Could not connect to Runki. Check that Web is on.'); }
+  finally { busy = false; $('busy').textContent = ''; }
+}
+function render(view) {
+  session = view;
+  $('library').hidden = true;
+  $('study').hidden = false;
+  $('deck-name').textContent = view.deck_name;
+  $('save-warning').hidden = !view.save_blocked;
+  $('front').textContent = view.front || '';
+  $('back').textContent = view.back || '';
+  $('back').hidden = !view.revealed;
+  $('card').hidden = view.empty;
+  $('empty').hidden = !view.empty;
+  $('empty').textContent = view.total === 0 ? 'This deck has no cards.' : view.filter === 'unseen' ? 'All cards have been seen. Reset progress or show All to continue.' : view.filter === 'later' ? 'No study-later cards. Show All to flag some.' : 'No cards in this view.';
+  $('position').textContent = (view.position === null ? '—' : view.position) + ' / ' + view.view_total;
+  $('counts').textContent = view.seen + ' / ' + view.total + ' seen · ' + view.later + ' later';
+  $('space').textContent = view.revealed ? 'Next' : 'Reveal';
+  $('space').disabled = view.empty;
+  $('later').disabled = view.empty;
+  $('later').classList.toggle('active', view.is_later);
+  $('later').setAttribute('aria-pressed', String(view.is_later));
+  $('later').textContent = view.is_later ? 'Later ✓' : 'Later';
+  $('order').value = view.order;
+  $('filter').value = view.filter;
+  $('reshuffle').disabled = view.order !== 'shuffled';
+}
+async function library() {
+  session = null;
+  $('study').hidden = true;
+  $('library').hidden = false;
+  $('decks').replaceChildren();
+  $('folder').textContent = '';
+  $('library-message').textContent = '';
+  try {
+    const data = await api('library');
+    $('folder').textContent = data.library || '';
+    $('library-message').textContent = data.entries.length ? '' : 'No decks in this library. Add a deck in Runki, then refresh.';
+    for (const entry of data.entries) {
+      const row = document.createElement('button');
+      row.className = 'deck';
+      row.disabled = entry.status !== 'ready';
+      const name = document.createElement('strong');
+      name.textContent = entry.display_name;
+      const details = document.createElement('small');
+      if (entry.status === 'ready') {
+        const opened = entry.opened_at > 0 ? new Date(entry.opened_at).toLocaleDateString() : 'never';
+        details.textContent = entry.seen + ' / ' + entry.total + ' seen · ' + entry.later + ' later · Last opened: ' + opened;
+      } else {
+        details.textContent = entry.status === 'not_downloaded' ? 'Not downloaded — download in Runki’s library folder first.' : 'Failed: ' + entry.error;
+      }
+      row.append(name, details);
+      row.addEventListener('click', () => action(async () => render(await api('session/open', {deck:entry.id}))));
+      $('decks').append(row);
+    }
+  } catch (err) {
+    $('library-message').textContent = err.message;
+    throw err;
+  }
+}
+const mutate = (path, body = {}) => action(async () => render(await api('session/' + path, body)));
+$('refresh').onclick = () => action(library);
+$('card').onclick = $('space').onclick = () => { if (session && !session.empty) mutate('space'); };
+$('later').onclick = () => mutate('toggle-later');
+$('order').onchange = () => mutate('order', {order:$('order').value});
+$('filter').onchange = () => mutate('filter', {filter:$('filter').value});
+$('reshuffle').onclick = () => mutate('reshuffle');
+$('reset').onclick = () => { if (!busy && confirm('Clear seen progress? Study-later flags will be kept.')) mutate('reset'); };
+$('close').onclick = () => action(async () => { await api('session/close', {}); await library(); });
+document.addEventListener('keydown', event => {
+  if (!session || busy || event.repeat || event.ctrlKey || event.altKey || event.metaKey || ['INPUT','SELECT','TEXTAREA'].includes(event.target.tagName)) return;
+  const key = event.key.toLowerCase();
+  if (key === ' ' || key === 'l' || ['1','2','3'].includes(key)) {
+    event.preventDefault();
+    if (key === ' ') { if (!session.empty) mutate('space'); }
+    else if (key === 'l') { if (!session.empty) mutate('toggle-later'); }
+    else mutate('filter', {filter:{'1':'all','2':'unseen','3':'later'}[key]});
+  }
+});
+action(async () => {
+  const status = await api('status');
+  $('version').textContent = 'v' + status.version;
+  if (status.deck_open) render(await api('session'));
+  else await library();
+});
+</script>
+</body>
+</html>

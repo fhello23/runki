@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub library: Option<PathBuf>,
@@ -15,6 +15,26 @@ pub struct Config {
     pub last_open_deck: Option<PathBuf>,
     #[serde(default)]
     pub terminal_light: bool,
+    #[serde(default)]
+    pub web_on: bool,
+    #[serde(default = "default_web_port")]
+    pub web_port: u16,
+}
+
+fn default_web_port() -> u16 {
+    8765
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            library: None,
+            last_open_deck: None,
+            terminal_light: false,
+            web_on: false,
+            web_port: default_web_port(),
+        }
+    }
 }
 
 /// Import the pre-TUI desktop settings without changing the old app.ron file.
@@ -95,6 +115,8 @@ mod tests {
         let config = load_legacy_file(&path).unwrap().unwrap();
         assert_eq!(config.library, Some(PathBuf::from("/my/decks")));
         assert!(!config.terminal_light);
+        assert!(!config.web_on);
+        assert_eq!(config.web_port, 8765);
         assert_eq!(std::fs::read_to_string(path).unwrap(), text);
         assert_eq!(
             serde_json::from_str::<Config>("{}").unwrap(),
@@ -110,6 +132,8 @@ mod tests {
         let config = Config {
             library: Some(dir.path().to_path_buf()),
             last_open_deck: None,
+            web_on: true,
+            web_port: 9876,
             ..Default::default()
         };
         save(&path, &config).unwrap();

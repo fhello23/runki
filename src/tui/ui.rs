@@ -55,8 +55,15 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         0
     };
-    let [header, status, body, banner, footer] = Layout::vertical([
+    let [header, web_status, status, body, banner, footer] = Layout::vertical([
         Constraint::Length(2),
+        Constraint::Length(if app.web.is_some() {
+            3
+        } else if app.web_error.is_some() {
+            2
+        } else {
+            0
+        }),
         Constraint::Length(2),
         Constraint::Min(1),
         Constraint::Length(message_height),
@@ -81,6 +88,24 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
         .block(Block::default().borders(Borders::BOTTOM)),
         header,
     );
+    if let Some(server) = &app.web {
+        frame.render_widget(
+            Paragraph::new(format!(
+                " Web: {}\n {}",
+                server.lan_url(),
+                crate::web::WARNING
+            ))
+            .wrap(Wrap { trim: false }),
+            web_status,
+        );
+    } else if let Some(error) = &app.web_error {
+        frame.render_widget(
+            Paragraph::new(safe(error))
+                .style(Style::default().fg(Color::Red))
+                .wrap(Wrap { trim: false }),
+            web_status,
+        );
+    }
     if app.session.is_some() {
         study(frame, app, status, body);
     } else {
@@ -100,9 +125,9 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
         );
     }
     let hints = if app.session.is_some() {
-        " Space reveal/next  l later  1/2/3 filter  d/s order  r shuffle  R reset  b library  o open  ? help  q quit"
+        " Space reveal/next  l later  1/2/3 filter  d/s order  r shuffle  R reset  b library  o open  w web  ? help  q quit"
     } else {
-        " ↑/↓ select  Enter study  a add  c folder  o open  r refresh  t theme  ? help  q quit"
+        " ↑/↓ select  Enter study  a add  c folder  o open  r refresh  t theme  w web  ? help  q quit"
     };
     frame.render_widget(
         Paragraph::new(hints)
@@ -325,7 +350,7 @@ fn draw_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
         Dialog::Reset => ("Reset seen progress?", "Clear seen marks for every card in this deck?\nStudy-later flags are kept.\n\ny / Enter reset · n / Esc cancel".into()),
         Dialog::Discard(_) => ("Progress could not be saved", "Your session is still open. Fix the save error and try again, or continue and lose unsaved changes.\n\ny discard changes and continue · n / Esc keep studying".into()),
         Dialog::Message(message) => ("Message · ↑/↓ scroll · Esc close", safe(message)),
-        Dialog::Help => ("Controls · ↑/↓ scroll · Esc close", "EVERYWHERE\nq / Ctrl+c save and quit · o open deck · t light/dark\ne full message / error\n? help · Esc dismiss message or cancel dialog\n\nLIBRARY\n↑/↓ or j/k select · Enter study · a copy deck into library\nc choose/create folder · r refresh · Home/End first/last\nPageUp/PageDown move ten rows\n\nSTUDY\nSpace / Enter reveal answer, then next card (wraps)\nl toggle study later · b save and return to library\n1 all · 2 unseen · 3 study later\nd deck order · s shuffled · r reshuffle\nR reset seen progress (asks first; flags kept)\n↑/↓ or j/k scroll · PageUp/PageDown scroll ten lines\nHome/End top/bottom of card\n\nPATH INPUT: type or paste · Backspace delete · Ctrl+u clear\n\nEnter / ? / Esc close help".into()),
+        Dialog::Help => ("Controls · ↑/↓ scroll · Esc close", "EVERYWHERE\nq / Ctrl+c save and quit · o open deck · t light/dark\nw toggle LAN Web (no login; anyone on this network can change progress)\ne full message / error\n? help · Esc dismiss message or cancel dialog\n\nLIBRARY\n↑/↓ or j/k select · Enter study · a copy deck into library\nc choose/create folder · r refresh · Home/End first/last\nPageUp/PageDown move ten rows\n\nSTUDY\nSpace / Enter reveal answer, then next card (wraps)\nl toggle study later · b save and return to library\n1 all · 2 unseen · 3 study later\nd deck order · s shuffled · r reshuffle\nR reset seen progress (asks first; flags kept)\n↑/↓ or j/k scroll · PageUp/PageDown scroll ten lines\nHome/End top/bottom of card\n\nPATH INPUT: type or paste · Backspace delete · Ctrl+u clear\n\nEnter / ? / Esc close help".into()),
     };
     let width = area.width.saturating_sub(4).min(90);
     let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });

@@ -116,6 +116,7 @@ edit, and `Ctrl+u` to clear the input. `Esc` cancels a dialog.
 | `↑` / `↓` or `j` / `k`, `PageUp` / `PageDown`, `Home` / `End` | Scroll long cards; navigate library rows |
 | `b` | Save and return to the library |
 | `t` | Toggle light/dark terminal colours (remembered) |
+| `w` | Toggle the LAN web interface |
 | `?`, `e` | Scrollable help, full error/status message |
 | `q` / `Ctrl+c` | Save and quit |
 
@@ -137,6 +138,61 @@ per-machine `runki/config.json` inside the OS config directory:
 settings import automatically without altering the old settings file.
 Deck progress stays in the same library `.runki/` folder or sidecar
 described below, so switching interfaces resumes the same session.
+
+## Web interface
+
+Study from a phone or another browser on the same network. Choose a library
+folder in Runki, then open **Web: Off** / **Web: On** in either desktop
+screen's top bar and enable **Web server on**. The same configuration pane
+shows the LAN address, **Copy URL**, a localhost address, and an editable
+port. In the TUI, press `w` in the library or study screen. Open the displayed
+`http://…:8765/` URL on your phone. Keep Runki running; turning Web off or
+quitting stops the server.
+
+On macOS, the **Runki** app menu also has a checked **Web Server** toggle.
+The address item below it copies the LAN URL when clicked; when the server
+is off it is disabled and labelled **Web Server Off**. These menu items
+follow the in-app controls and current port.
+
+**Anyone on this network can study and change progress.** There is no
+login, PIN or encryption. Use Web only on a trusted network; do not forward
+its port to the internet. macOS may ask whether Runki can accept incoming
+network connections; allow it to reach Runki from your phone.
+
+Web is off on first launch. The toggle choice and the port in the shared
+config (`web_on`, `web_port`, default `8765`) are remembered. You can override
+them for one run:
+
+```sh
+runki --web --library ~/Decks
+runki --tui --web --web-port 9000
+runki --no-web
+```
+
+`--web`, `--no-web` and `--web-port` do not change the remembered settings.
+Using either desktop toggle or TUI `w` remembers its new on/off choice.
+A CLI port override still lasts only for that run unless you deliberately
+edit the port in the desktop Web pane and click **Apply**. Apply accepts only
+digits from `1` to `65535` and remembers the new port for both interfaces,
+including the TUI on its next launch.
+
+When Web is on, Apply restarts it on the new port; reconnect using the new
+address. If the new port is busy, Runki restores the old listener and shows
+an error without changing the remembered port. If restoring the old listener
+also fails, Web turns off. Starting Web on a busy port likewise leaves it
+off with an error.
+
+The browser can browse the library, reveal and advance cards, toggle study
+later, change order and filters, reshuffle, and reset seen progress. Decks
+must be downloaded and inside the chosen library; a deck opened separately
+by path is not offered on the web. Add decks and choose folders in Runki.
+
+Browser changes save after each action to the same `.runki/` progress files
+as the desktop and TUI, with the existing merge-on-save behavior. The web
+interface has its own study session (shared by browsers connected to that
+Runki instance); it does not mirror the desktop's current card. Reopen a
+deck to pick up another session's position and preferences. Card text is
+plain text, with no image or audio serving.
 
 ## Version
 

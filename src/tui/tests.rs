@@ -336,7 +336,75 @@ fn terminal_entry_point_rejects_redirected_io_without_creating_settings() {
     }
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.json");
-    let err = run(Config::default(), path.clone(), None).unwrap_err();
+    let err = run(Config::default(), path.clone(), None, WebOptions::default()).unwrap_err();
     assert!(err.to_string().contains("interactive terminal"));
     assert!(!path.exists());
+}
+
+#[test]
+fn web_toggle_works_on_both_screens_but_not_in_path_input() {
+    let (mut app, _dir, deck) = setup();
+    app.web_port = 0;
+    char_key(&mut app, 'w');
+    assert!(app.web.is_some());
+    assert!(app.config.web_on);
+    assert!(config::load(&app.config_path).unwrap().unwrap().web_on);
+    assert!(render(&mut app, 100, 24).contains("Web: http://"));
+    assert!(render(&mut app, 100, 24).contains(WARNING));
+    app.open(deck).unwrap();
+    char_key(&mut app, 'w');
+    assert!(app.web.is_none());
+    assert!(!app.config.web_on);
+    char_key(&mut app, 'o');
+    char_key(&mut app, 'w');
+    assert!(matches!(&app.dialog, Some(Dialog::Path {input, ..}) if input == "w"));
+    assert!(app.web.is_none());
+}
+
+#[test]
+fn web_cli_overrides_are_temporary_and_library_changes_reach_the_server_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    let config = Config {
+        web_on: true,
+        web_port: 4321,
+        ..Default::default()
+    };
+    let mut app = App::new_with_web_options(
+        config.clone(),
+        path.clone(),
+        WebOptions {
+            on: Some(false),
+            port: Some(0),
+        },
+    );
+    assert!(app.web.is_none());
+    app.persist_config();
+    assert_eq!(config::load(&path).unwrap(), Some(config));
+    app.submit_path(PathAction::Library, dir.path().to_str().unwrap())
+        .unwrap();
+    assert_eq!(*app.library_slot.read().unwrap(), app.config.library);
+    char_key(&mut app, 'w');
+    assert!(app.web.is_some());
+    assert_eq!(app.config.web_port, 4321);
+    assert_ne!(app.web.as_ref().unwrap().local_addr.port(), 0);
+    char_key(&mut app, 'w');
+    assert!(!config::load(&path).unwrap().unwrap().web_on);
+    assert_eq!(config::load(&path).unwrap().unwrap().web_port, 4321);
+}
+
+#[test]
+fn web_start_failure_is_visible_and_leaves_toggle_off() {
+    let (mut app, _dir, _) = setup();
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+    app.web_port = listener.local_addr().unwrap().port();
+    char_key(&mut app, 'w');
+    assert!(app.web.is_none());
+    assert!(!app.config.web_on);
+    assert!(app
+        .web_error
+        .as_deref()
+        .unwrap()
+        .contains("Could not start Web"));
+    assert!(render(&mut app, 100, 24).contains("Could not start Web"));
 }
