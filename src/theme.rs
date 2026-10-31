@@ -155,9 +155,9 @@ fn apply(style: &mut egui::Style, p: &Palette, base: Visuals) {
     v.faint_bg_color = p.hover;
     v.hyperlink_color = p.accent;
     v.selection.bg_fill = p.accent.gamma_multiply(0.3);
-    v.selection.stroke = Stroke::new(1.0, p.accent);
+    v.selection.stroke = Stroke::new(1.0_f32, p.accent);
     v.window_corner_radius = CornerRadius::same(12);
-    v.window_stroke = Stroke::new(1.0, p.line);
+    v.window_stroke = Stroke::new(1.0_f32, p.line);
     v.window_shadow = Shadow {
         offset: [0, 8],
         blur: 24,
@@ -179,20 +179,20 @@ fn apply(style: &mut egui::Style, p: &Palette, base: Visuals) {
         state.expansion = 0.0;
     }
     // Separators are drawn with the non-interactive stroke.
-    w.noninteractive.bg_stroke = Stroke::new(1.0, p.line);
-    w.noninteractive.fg_stroke = Stroke::new(1.0, p.text);
+    w.noninteractive.bg_stroke = Stroke::new(1.0_f32, p.line);
+    w.noninteractive.fg_stroke = Stroke::new(1.0_f32, p.text);
     w.noninteractive.bg_fill = p.surface;
     w.noninteractive.weak_bg_fill = p.surface;
     // Buttons are ghosts until hovered.
     w.inactive.weak_bg_fill = Color32::TRANSPARENT;
     w.inactive.bg_fill = p.hover;
-    w.inactive.fg_stroke = Stroke::new(1.0, p.text);
+    w.inactive.fg_stroke = Stroke::new(1.0_f32, p.text);
     w.hovered.weak_bg_fill = p.hover;
     w.hovered.bg_fill = p.hover;
-    w.hovered.fg_stroke = Stroke::new(1.0, p.text);
+    w.hovered.fg_stroke = Stroke::new(1.0_f32, p.text);
     w.active.weak_bg_fill = p.line;
     w.active.bg_fill = p.line;
-    w.active.fg_stroke = Stroke::new(1.0, p.text);
+    w.active.fg_stroke = Stroke::new(1.0_f32, p.text);
     w.open = w.hovered;
 
     style.visuals = v;
