@@ -3,39 +3,30 @@
 //! - `Space` shows the answer, then moves to the next card (wrapping
 //!   around at the end, so browsing never stops).
 //! - `L` toggles the current card in the study-later list.
-//! - The top bar switches between all cards and study-later only.
+//! - The top bar picks the card order (deck order or shuffled) and
+//!   which cards to show (all, unseen only, or study-later only).
+//!
+//! Study logic (order, filter, position, saving) lives in
+//! [`crate::session::StudySession`]; this module keeps the save
+//! debounce, error banners, file picker, and drag-and-drop.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 
-use crate::deck::{self, Deck};
-use crate::progress::{self, DeckState, LoadOutcome};
+use crate::deck::{self, Card};
+use crate::progress::{self, CardFilter, CardOrder, LoadOutcome};
+use crate::session::StudySession;
 
 /// How often a dirty state is written while studying.
 const SAVE_INTERVAL: Duration = Duration::from_secs(2);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    All,
-    Later,
-}
-
 pub struct RunkiApp {
-    deck: Option<Deck>,
-    /// Index into the current view (all cards, or flagged only).
-    pos: usize,
-    revealed: bool,
-    mode: Mode,
-    state: DeckState,
-    state_path: Option<PathBuf>,
-    /// Set when the progress file could not be read: changes still
-    /// update `state` in memory but must not overwrite the file.
-    save_blocked: bool,
-    /// `state` has unsaved changes.
-    dirty: bool,
+    session: Option<StudySession>,
     last_save_attempt: Option<Instant>,
+    /// The reset-progress confirmation dialog is open.
+    show_reset_confirm: bool,
     error: Option<String>,
     /// Error from the last save attempt; cleared by the next
     /// successful save. Kept apart from `error` so a background save
@@ -46,15 +37,9 @@ pub struct RunkiApp {
 impl RunkiApp {
     pub fn new(initial_deck: Option<PathBuf>) -> Self {
         let mut app = Self {
-            deck: None,
-            pos: 0,
-            revealed: false,
-            mode: Mode::All,
-            state: DeckState::new(),
-            state_path: None,
-            save_blocked: false,
-            dirty: false,
+            session: None,
             last_save_attempt: None,
+            show_reset_confirm: false,
             error: None,
             save_error: None,
         };
@@ -69,14 +54,15 @@ impl RunkiApp {
             Ok(deck) => {
                 // Always save the outgoing deck's progress first, and
                 // say so if that failed: its unsaved changes are lost.
+                let outgoing_name = self.session.as_ref().map(|s| s.deck().name.clone());
                 self.save_now();
                 let outgoing_error = self.save_error.take().map(|err| {
-                    let name = self.deck.as_ref().map_or("the previous deck", |d| &d.name);
+                    let name = outgoing_name.as_deref().unwrap_or("the previous deck");
                     format!("Progress for {name} could not be saved: {err}")
                 });
                 let state_path = progress::state_path(&deck.path, None);
                 let outcome = progress::load(&deck.path, &state_path);
-                self.save_blocked = outcome.is_blocked();
+                let save_blocked = outcome.is_blocked();
                 let load_error = match &outcome {
                     LoadOutcome::Blocked { error, .. } => Some(format!(
                         "{error:#}. Progress could not be read, so \
@@ -89,17 +75,15 @@ impl RunkiApp {
                     (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
                     (a, b) => a.or(b),
                 };
-                // A migrated state only exists in memory until saved.
-                self.dirty = outcome.is_migrated();
-                self.state = outcome.into_state();
-                self.state_path = Some(state_path);
-                // Opening is itself a state change.
-                self.state.mark_opened(progress::now_ms());
-                self.dirty = true;
-                self.deck = Some(deck);
-                self.pos = 0;
-                self.revealed = false;
-                self.mode = Mode::All;
+                let state = outcome.into_state();
+                self.session = Some(StudySession::new(
+                    deck,
+                    state,
+                    state_path,
+                    save_blocked,
+                    progress::now_ms(),
+                ));
+                self.show_reset_confirm = false;
             }
             Err(err) => {
                 self.error = Some(format!("{err:#}"));
@@ -114,20 +98,15 @@ impl RunkiApp {
     }
 
     fn save_now_at(&mut self, now: Instant) {
-        if !self.dirty || self.save_blocked {
-            return;
-        }
-        let Some(state_path) = &self.state_path else {
+        let Some(session) = &mut self.session else {
             return;
         };
-        if self.deck.is_none() {
+        if !session.dirty() || session.save_blocked() {
             return;
         }
         self.last_save_attempt = Some(now);
-        match progress::save(state_path, &self.state) {
-            Ok(merged) => {
-                self.state = merged;
-                self.dirty = false;
+        match session.save() {
+            Ok(()) => {
                 self.save_error = None;
             }
             Err(err) => {
@@ -140,7 +119,8 @@ impl RunkiApp {
     /// the last save attempt. Returns how long until the next attempt
     /// is due, so the caller can schedule a repaint for it.
     fn maybe_save_debounced_at(&mut self, now: Instant) -> Option<Duration> {
-        if !self.dirty || self.save_blocked {
+        let session = self.session.as_ref()?;
+        if !session.dirty() || session.save_blocked() {
             return None;
         }
         let due = self
@@ -151,11 +131,14 @@ impl RunkiApp {
         }
         // Still dirty (not due yet, or the save failed): next attempt
         // is due one interval after the last one.
-        self.dirty.then(|| {
-            self.last_save_attempt
-                .map(|last| (last + SAVE_INTERVAL).saturating_duration_since(now))
-                .unwrap_or(Duration::ZERO)
-        })
+        self.session
+            .as_ref()
+            .is_some_and(StudySession::dirty)
+            .then(|| {
+                self.last_save_attempt
+                    .map(|last| (last + SAVE_INTERVAL).saturating_duration_since(now))
+                    .unwrap_or(Duration::ZERO)
+            })
     }
 
     fn pick_and_open(&mut self) {
@@ -167,102 +150,25 @@ impl RunkiApp {
         }
     }
 
-    /// Indices of the flagged cards, visible in `Mode::Later`.
-    fn later_view(&self) -> Vec<usize> {
-        let Some(deck) = &self.deck else {
-            return Vec::new();
-        };
-        deck.cards
-            .iter()
-            .enumerate()
-            .filter(|(_, card)| self.state.is_later(&card.id))
-            .map(|(i, _)| i)
-            .collect()
+    /// The card on screen with its `(n, view_len)` position.
+    fn current(&self) -> Option<(&Card, usize, usize)> {
+        let session = self.session.as_ref()?;
+        let card = session.current_card()?;
+        let (n, total) = session.view_position()?;
+        Some((card, n, total))
     }
 
-    /// Number of cards visible in the current mode.
-    fn view_len(&self) -> usize {
-        let Some(deck) = &self.deck else {
-            return 0;
-        };
-        match self.mode {
-            Mode::All => deck.cards.len(),
-            Mode::Later => self.later_count(),
-        }
-    }
-
-    /// Index into `deck.cards` of the card at `self.pos` in the view.
-    fn current_index(&self) -> Option<usize> {
-        let deck = self.deck.as_ref()?;
-        match self.mode {
-            Mode::All => (self.pos < deck.cards.len()).then_some(self.pos),
-            Mode::Later => self.later_view().get(self.pos).copied(),
-        }
-    }
-
-    fn current(&self) -> Option<(&deck::Card, usize, usize)> {
-        let deck = self.deck.as_ref()?;
-        let idx = self.current_index()?;
-        Some((&deck.cards[idx], self.pos + 1, self.view_len()))
-    }
-
-    /// Space: reveal the answer, or advance (wrapping) if already shown.
-    /// Revealing marks the card seen.
+    /// Space: reveal the answer, or advance if already shown.
     fn space(&mut self) {
-        let view_len = self.view_len();
-        if view_len == 0 {
-            return;
-        }
-        if self.revealed {
-            self.pos = (self.pos + 1) % view_len;
-            self.revealed = false;
-        } else {
-            if let Some(card_id) = self.current().map(|(card, _, _)| card.id.clone()) {
-                self.state.mark_seen(&card_id, progress::now_ms());
-                self.dirty = true;
-            }
-            self.revealed = true;
+        if let Some(session) = &mut self.session {
+            session.space(progress::now_ms());
         }
     }
 
     /// L: toggle the current card in the study-later list.
-    /// The change is saved by the debounced saver.
     fn toggle_later(&mut self) {
-        let Some(card_id) = self.current().map(|(card, _, _)| card.id.clone()) else {
-            return;
-        };
-        let on = !self.state.is_later(&card_id);
-        self.state.set_later(&card_id, on, progress::now_ms());
-        self.dirty = true;
-        // Unflagging while reviewing the later list shrinks the view;
-        // keep the position pointing at the next remaining card.
-        let view_len = self.view_len();
-        if view_len == 0 {
-            self.pos = 0;
-        } else if self.pos >= view_len {
-            self.pos = view_len - 1;
-        }
-        // If a different card is now shown, hide its answer.
-        if self.current().map(|(c, _, _)| &c.id) != Some(&card_id) {
-            self.revealed = false;
-        }
-    }
-
-    /// Number of cards in the open deck that are flagged for later.
-    /// Stale ids matching no card are ignored (but kept in the state).
-    fn later_count(&self) -> usize {
-        let Some(deck) = &self.deck else {
-            return 0;
-        };
-        self.state
-            .later_count(deck.cards.iter().map(|card| card.id.as_str()))
-    }
-
-    fn set_mode(&mut self, mode: Mode) {
-        if self.mode != mode {
-            self.mode = mode;
-            self.pos = 0;
-            self.revealed = false;
+        if let Some(session) = &mut self.session {
+            session.toggle_later(progress::now_ms());
         }
     }
 }
@@ -280,14 +186,21 @@ impl eframe::App for RunkiApp {
         }
 
         // Consume Space/L before widgets see them, so a focused button
-        // cannot also trigger on Space and double-advance.
+        // cannot also trigger on Space and double-advance. While the
+        // reset confirmation is open they are consumed but ignored.
         let space = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space));
         let later_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::L));
-        if space {
-            self.space();
+        let escape = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        if escape {
+            self.show_reset_confirm = false;
         }
-        if later_key {
-            self.toggle_later();
+        if !self.show_reset_confirm {
+            if space {
+                self.space();
+            }
+            if later_key {
+                self.toggle_later();
+            }
         }
 
         // Debounced save, with a repaint scheduled so a pending save
@@ -299,53 +212,93 @@ impl eframe::App for RunkiApp {
         self.top_bar(ctx);
         self.bottom_bar(ctx);
         self.central(ctx);
+        self.reset_confirm(ctx);
     }
 }
 
 impl RunkiApp {
     fn top_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("Open deck...").clicked() {
                     self.pick_and_open();
                 }
                 ui.separator();
-                match &self.deck {
-                    Some(deck) => {
-                        ui.strong(&deck.name);
-                        ui.label(format!("{} cards", deck.cards.len()));
+                match &self.session {
+                    Some(session) => {
+                        ui.strong(&session.deck().name);
+                        let seen = session.seen_count();
+                        ui.label(format!("{seen} / {} seen", session.total()));
+                        // Starting over must not require seeing every card first.
+                        if seen > 0
+                            && ui
+                                .small_button("Reset…")
+                                .on_hover_text("Clear which cards you have seen")
+                                .clicked()
+                        {
+                            self.show_reset_confirm = true;
+                        }
                     }
                     None => {
                         ui.label("No deck open");
                     }
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let later_label = format!("Study later ({})", self.later_count());
-                    if ui
-                        .selectable_label(self.mode == Mode::Later, later_label)
-                        .clicked()
-                    {
-                        self.set_mode(Mode::Later);
-                    }
-                    if ui
-                        .selectable_label(self.mode == Mode::All, "All cards")
-                        .clicked()
-                    {
-                        self.set_mode(Mode::All);
-                    }
-                });
+                let Some(session) = &mut self.session else {
+                    return;
+                };
+                let now = progress::now_ms();
+                ui.separator();
+                ui.label("Order:");
+                if ui
+                    .selectable_label(session.card_order() == CardOrder::Deck, "Deck order")
+                    .clicked()
+                {
+                    session.set_order(CardOrder::Deck, now);
+                }
+                if ui
+                    .selectable_label(session.card_order() == CardOrder::Shuffled, "Shuffled")
+                    .clicked()
+                {
+                    session.set_order(CardOrder::Shuffled, now);
+                }
+                if session.card_order() == CardOrder::Shuffled && ui.button("Reshuffle").clicked() {
+                    session.reshuffle(now);
+                }
+                ui.separator();
+                ui.label("Show:");
+                if ui
+                    .selectable_label(session.filter() == CardFilter::All, "All")
+                    .clicked()
+                {
+                    session.set_filter(CardFilter::All, now);
+                }
+                if ui
+                    .selectable_label(session.filter() == CardFilter::Unseen, "Unseen")
+                    .clicked()
+                {
+                    session.set_filter(CardFilter::Unseen, now);
+                }
+                let later_label = format!("Study later ({})", session.later_count());
+                if ui
+                    .selectable_label(session.filter() == CardFilter::Later, later_label)
+                    .clicked()
+                {
+                    session.set_filter(CardFilter::Later, now);
+                }
             });
         });
     }
 
     fn bottom_bar(&mut self, ctx: &egui::Context) {
-        let current = self
-            .current()
-            .map(|(card, n, total)| (self.state.is_later(&card.id), n, total));
+        let current = self.session.as_ref().and_then(|session| {
+            let card = session.current_card()?;
+            let (n, total) = session.view_position()?;
+            Some((session.is_later(&card.id), session.revealed(), n, total))
+        });
         egui::TopBottomPanel::bottom("bottom").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.add_enabled_ui(current.is_some(), |ui| {
-                    let label = if self.revealed {
+                    let label = if current.is_some_and(|(_, revealed, _, _)| revealed) {
                         "Next card  (Space)"
                     } else {
                         "Show answer  (Space)"
@@ -356,7 +309,7 @@ impl RunkiApp {
                     {
                         self.space();
                     }
-                    let flagged = current.is_some_and(|(flagged, _, _)| flagged);
+                    let flagged = current.is_some_and(|(flagged, _, _, _)| flagged);
                     let label = if flagged {
                         "In study-later list  (L)"
                     } else {
@@ -368,7 +321,7 @@ impl RunkiApp {
                         self.toggle_later();
                     }
                 });
-                if let Some((_, n, total)) = current {
+                if let Some((_, _, n, total)) = current {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(format!("{n} / {total}"));
                     });
@@ -395,7 +348,7 @@ impl RunkiApp {
             let Some(current) = self.current() else {
                 ui.vertical_centered(|ui| {
                     ui.add_space(80.0);
-                    if self.deck.is_none() {
+                    let Some(session) = &self.session else {
                         ui.heading("Runki");
                         ui.add_space(8.0);
                         ui.label("Open an .apkg, .csv, .tsv, or .txt deck, or drop the file here.");
@@ -410,27 +363,45 @@ impl RunkiApp {
                         {
                             self.pick_and_open();
                         }
-                    } else if self.mode == Mode::Later {
-                        ui.heading("Nothing flagged yet");
-                        ui.add_space(8.0);
-                        ui.label("Press L on a card to add it to this list.");
-                    } else {
-                        ui.heading("This deck has no cards to show");
+                        return;
+                    };
+                    match session.filter() {
+                        CardFilter::Unseen => {
+                            ui.heading(format!("You've seen all {} cards", session.total()));
+                            ui.add_space(16.0);
+                            if ui
+                                .add(egui::Button::new(
+                                    egui::RichText::new("Reset progress").size(18.0),
+                                ))
+                                .clicked()
+                            {
+                                self.show_reset_confirm = true;
+                            }
+                        }
+                        CardFilter::Later => {
+                            ui.heading("Nothing flagged yet");
+                            ui.add_space(8.0);
+                            ui.label("Press L on a card to add it to this list.");
+                        }
+                        CardFilter::All => {
+                            ui.heading("This deck has no cards to show");
+                        }
                     }
                 });
                 return;
             };
 
             let (card, _, _) = current;
+            let session = self.session.as_ref().expect("session for current card");
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.add_space(24.0);
                 ui.vertical_centered(|ui| {
-                    if self.state.is_later(&card.id) {
+                    if session.is_later(&card.id) {
                         ui.small("STUDY LATER");
                         ui.add_space(8.0);
                     }
                     ui.add(egui::Label::new(egui::RichText::new(&card.front).size(30.0)).wrap());
-                    if self.revealed {
+                    if session.revealed() {
                         ui.add_space(16.0);
                         ui.separator();
                         ui.add_space(16.0);
@@ -441,12 +412,55 @@ impl RunkiApp {
             });
         });
     }
+
+    /// Confirmation dialog for clearing a deck's seen marks.
+    fn reset_confirm(&mut self, ctx: &egui::Context) {
+        if !self.show_reset_confirm {
+            return;
+        }
+        let response = egui::Modal::new(egui::Id::new("reset_progress")).show(ctx, |ui| {
+            ui.heading("Reset progress?");
+            ui.add_space(8.0);
+            ui.label(
+                "This clears which cards you have seen in this deck. \
+                 Study-later flags are kept.",
+            );
+            ui.add_space(16.0);
+            let mut choice = None;
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    choice = Some(false);
+                }
+                if ui.button("Reset progress").clicked() {
+                    choice = Some(true);
+                }
+            });
+            choice
+        });
+        match response.inner {
+            Some(true) => {
+                if let Some(session) = &mut self.session {
+                    session.reset(progress::now_ms());
+                }
+                self.show_reset_confirm = false;
+            }
+            Some(false) => {
+                self.show_reset_confirm = false;
+            }
+            None => {
+                if response.backdrop_response.clicked() {
+                    self.show_reset_confirm = false;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::deck::Card;
+    use crate::deck::{Card, Deck};
+    use crate::progress::DeckState;
 
     struct TempDir(std::path::PathBuf);
 
@@ -456,13 +470,7 @@ mod tests {
         }
     }
 
-    fn test_app(
-        test_name: &str,
-        later: &[&str],
-        mode: Mode,
-        pos: usize,
-        revealed: bool,
-    ) -> (RunkiApp, TempDir) {
+    fn test_app(test_name: &str, later: &[&str]) -> (RunkiApp, TempDir) {
         let dir =
             std::env::temp_dir().join(format!("runki-test-{}-{}", test_name, std::process::id()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
@@ -481,121 +489,77 @@ mod tests {
             state.set_later(id, true, 0);
         }
         let state_path = progress::state_path(&deck_path, None);
-        let app = RunkiApp {
-            deck: Some(Deck {
+        let session = StudySession::new(
+            Deck {
                 name: "test".to_string(),
                 path: deck_path,
                 cards,
-            }),
-            pos,
-            revealed,
-            mode,
+            },
             state,
-            state_path: Some(state_path),
-            save_blocked: false,
-            dirty: false,
+            state_path,
+            false,
+            1_000,
+        );
+        let app = RunkiApp {
+            session: Some(session),
             last_save_attempt: None,
+            show_reset_confirm: false,
             error: None,
             save_error: None,
         };
         (app, guard)
     }
 
-    #[test]
-    fn later_unflag_first_hides_next_cards_answer() {
-        let (mut app, _temp) =
-            test_app("later-unflag-first", &["a", "b", "c"], Mode::Later, 0, true);
-
-        app.toggle_later();
-
-        assert_eq!(app.pos, 0);
-        assert!(!app.revealed);
-        let (card, _, _) = app.current().expect("next card shown");
-        assert_eq!(card.id, "b");
-    }
-
-    #[test]
-    fn later_unflag_middle_hides_next_cards_answer() {
-        let (mut app, _temp) = test_app(
-            "later-unflag-middle",
-            &["a", "b", "c"],
-            Mode::Later,
-            1,
-            true,
-        );
-
-        app.toggle_later();
-
-        assert_eq!(app.pos, 1);
-        assert!(!app.revealed);
-        let (card, _, _) = app.current().expect("next card shown");
-        assert_eq!(card.id, "c");
-    }
-
-    #[test]
-    fn later_unflag_last_remaining_empties_view() {
-        let (mut app, _temp) = test_app("later-unflag-last", &["a"], Mode::Later, 0, true);
-
-        app.toggle_later();
-
-        assert_eq!(app.pos, 0);
-        assert!(!app.revealed);
-        assert!(app.current().is_none());
-        assert_eq!(app.view_len(), 0);
+    fn session(app: &RunkiApp) -> &StudySession {
+        app.session.as_ref().expect("session")
     }
 
     #[test]
     fn later_count_ignores_stale_ids() {
-        let (app, _temp) = test_app(
-            "later-count-stale",
-            &["a", "stale-1", "stale-2"],
-            Mode::All,
-            0,
-            false,
-        );
+        let (app, _temp) = test_app("later-count-stale", &["a", "stale-1", "stale-2"]);
 
-        assert_eq!(app.later_count(), 1);
+        assert_eq!(session(&app).later_count(), 1);
         // Stale ids are not deleted from the in-memory state (or file).
-        assert_eq!(app.state.later.len(), 3);
-        assert!(app.state.is_later("stale-1"));
+        assert_eq!(session(&app).state().later.len(), 3);
+        assert!(session(&app).state().is_later("stale-1"));
     }
 
     #[test]
     fn error_cleared_after_successful_save() {
-        let (mut app, _temp) = test_app("error-cleared-on-save", &[], Mode::All, 0, false);
+        let (mut app, _temp) = test_app("error-cleared-on-save", &[]);
         // Make the first save fail by occupying the sidecar path with a dir.
-        let deck_path = app.deck.as_ref().expect("deck").path.clone();
+        let deck_path = session(&app).deck().path.clone();
         let sidecar = progress::state_path(&deck_path, None);
         std::fs::create_dir_all(&sidecar).expect("create blocking dir");
 
         app.toggle_later();
         app.save_now();
         assert!(app.save_error.is_some(), "failed save should set error");
-        assert!(app.dirty, "failed save stays dirty for a retry");
+        assert!(session(&app).dirty(), "failed save stays dirty");
 
         std::fs::remove_dir_all(&sidecar).expect("remove blocking dir");
         app.toggle_later();
         app.save_now();
         assert_eq!(app.save_error, None, "successful save should clear error");
-        assert!(!app.dirty);
+        assert!(!session(&app).dirty());
     }
 
     #[test]
     fn successful_save_keeps_unrelated_error() {
-        let (mut app, _temp) = test_app("save-keeps-error", &[], Mode::All, 0, false);
+        let (mut app, _temp) = test_app("save-keeps-error", &[]);
         app.error = Some("Could not open other.apkg".to_string());
 
         app.toggle_later();
         app.save_now();
 
-        assert!(!app.dirty);
+        assert!(!session(&app).dirty());
         assert_eq!(app.error.as_deref(), Some("Could not open other.apkg"));
     }
 
     #[test]
     fn failed_save_on_deck_switch_is_reported() {
-        let (mut app, temp) = test_app("switch-save-fails", &[], Mode::All, 0, false);
-        let deck_path = app.deck.as_ref().expect("deck").path.clone();
+        let (mut app, temp) = test_app("switch-save-fails", &[]);
+        let deck_path = session(&app).deck().path.clone();
         // Make saving the outgoing deck fail.
         std::fs::create_dir_all(progress::state_path(&deck_path, None))
             .expect("create blocking dir");
@@ -614,45 +578,9 @@ mod tests {
     }
 
     #[test]
-    fn all_toggle_flag_keeps_answer_shown_on_same_card() {
-        let (mut app, _temp) = test_app("all-toggle-flag", &[], Mode::All, 0, true);
-
-        app.toggle_later();
-
-        assert!(app.revealed);
-        assert!(app.state.is_later("a"));
-        let (card, _, _) = app.current().expect("card shown");
-        assert_eq!(card.id, "a");
-
-        app.toggle_later();
-
-        assert!(app.revealed);
-        assert!(!app.state.is_later("a"));
-        let (card, _, _) = app.current().expect("card shown");
-        assert_eq!(card.id, "a");
-    }
-
-    #[test]
-    fn reveal_marks_card_seen() {
-        let (mut app, _temp) = test_app("reveal-marks-seen", &[], Mode::All, 0, false);
-        assert!(!app.state.is_seen("a"));
-
-        app.space();
-
-        assert!(app.revealed);
-        assert!(app.state.is_seen("a"), "revealing marks the card seen");
-        assert!(app.dirty);
-
-        // Advancing does not mark the next card.
-        app.space();
-        assert!(!app.revealed);
-        assert!(!app.state.is_seen("b"));
-    }
-
-    #[test]
     fn debounced_save_writes_file() {
-        let (mut app, _temp) = test_app("debounced-save", &[], Mode::All, 0, false);
-        let state_path = app.state_path.clone().expect("state path");
+        let (mut app, _temp) = test_app("debounced-save", &[]);
+        let state_path = session(&app).state_path().clone();
         assert!(!state_path.exists());
 
         // First save attempt is immediate (nothing attempted yet).
@@ -660,7 +588,7 @@ mod tests {
         app.toggle_later();
         assert_eq!(app.maybe_save_debounced_at(now), None);
         assert!(state_path.exists(), "debounced save writes the file");
-        assert!(!app.dirty);
+        assert!(!session(&app).dirty());
 
         // A new change inside the interval waits, then saves once due.
         app.toggle_later();
@@ -668,10 +596,10 @@ mod tests {
             .maybe_save_debounced_at(now + Duration::from_secs(1))
             .expect("pending save should schedule a retry");
         assert_eq!(delay, Duration::from_secs(1));
-        assert!(app.dirty);
+        assert!(session(&app).dirty());
         app.maybe_save_debounced_at(now + Duration::from_secs(2));
-        assert!(!app.dirty);
-        let loaded = progress::load(&app.deck.as_ref().expect("deck").path, &state_path);
+        assert!(!session(&app).dirty());
+        let loaded = progress::load(&session(&app).deck().path, &state_path);
         assert!(!loaded.state().is_later("a"), "second toggle was saved");
     }
 
@@ -687,18 +615,16 @@ mod tests {
         std::fs::write(&second, "Q2\tA2\n").expect("write second deck");
 
         let mut app = RunkiApp::new(Some(first.clone()));
-        assert!(app.state.opened_at > 0, "opening stamps opened_at");
+        assert!(
+            session(&app).state().opened_at > 0,
+            "opening stamps opened_at"
+        );
         app.space();
         app.open_path(second);
 
         let first_state = progress::state_path(&first, None);
         assert!(first_state.exists(), "switching saved the first deck");
         let loaded = progress::load(&first, &first_state);
-        assert_eq!(
-            loaded.state().seen_count(["x"].into_iter()),
-            0,
-            "sanity: unknown ids are not seen"
-        );
         assert!(
             loaded.state().seen.values().any(|&t| t > 0),
             "seen mark was saved on switch"
@@ -724,8 +650,8 @@ mod tests {
         let state_path = progress::state_path(&deck_path, None);
 
         let mut app = RunkiApp::new(Some(deck_path));
-        assert!(app.deck.is_some(), "deck still opens");
-        assert!(app.save_blocked);
+        assert!(app.session.is_some(), "deck still opens");
+        assert!(session(&app).save_blocked());
         assert!(
             app.error
                 .as_deref()
@@ -738,7 +664,7 @@ mod tests {
         app.save_now();
 
         assert_eq!(
-            app.state.later.len(),
+            session(&app).state().later.len(),
             1,
             "toggle still updates in-memory state"
         );
@@ -767,7 +693,7 @@ mod tests {
         std::fs::write(&state_path, corrupt).expect("write corrupt state");
 
         let mut app = RunkiApp::new(Some(deck_path));
-        assert!(app.save_blocked);
+        assert!(session(&app).save_blocked());
 
         app.toggle_later();
         app.space();
@@ -799,10 +725,10 @@ mod tests {
         std::fs::write(&good_path, "Q1\tA1\n").expect("write good deck");
 
         let mut app = RunkiApp::new(Some(bad_path));
-        assert!(app.save_blocked);
+        assert!(session(&app).save_blocked());
 
         app.open_path(good_path.clone());
-        assert!(!app.save_blocked);
+        assert!(!session(&app).save_blocked());
         assert!(app.error.is_none());
 
         app.toggle_later();
