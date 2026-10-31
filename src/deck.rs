@@ -35,13 +35,25 @@ pub fn load_deck(path: &Path) -> Result<Deck> {
         .to_ascii_lowercase();
     let cards = match ext.as_str() {
         "apkg" => load_apkg(path)?,
-        "csv" => parse_delimited(&std::fs::read(path)?, b',')?,
-        "tsv" => parse_delimited(&std::fs::read(path)?, b'\t')?,
-        "txt" => {
+        "csv" | "tsv" | "txt" => {
             let bytes = std::fs::read(path)?;
-            let first_line = bytes.split(|&b| b == b'\n').next().unwrap_or(&[]);
-            let delim = if first_line.contains(&b'\t') { b'\t' } else { b',' };
-            parse_delimited(&bytes, delim)?
+            let (header_delim, body) = strip_anki_headers(&bytes);
+            let delim = header_delim.unwrap_or_else(|| match ext.as_str() {
+                "csv" => b',',
+                "tsv" => b'\t',
+                _ => {
+                    let first_line = body
+                        .split(|&b| b == b'\n')
+                        .find(|line| !line.trim_ascii().is_empty())
+                        .unwrap_or(&[]);
+                    if first_line.contains(&b'\t') {
+                        b'\t'
+                    } else {
+                        b','
+                    }
+                }
+            });
+            parse_delimited(body, delim)?
         }
         other => {
             return Err(anyhow!(
@@ -139,9 +151,86 @@ fn read_anki_db(db_path: &Path) -> Result<Vec<Card>> {
     Ok(cards)
 }
 
+/// Header keys Anki writes at the top of its plain-text exports.
+const ANKI_HEADER_KEYS: &[&str] = &[
+    "separator",
+    "html",
+    "tags",
+    "columns",
+    "notetype",
+    "deck",
+    "notetype column",
+    "deck column",
+    "tags column",
+    "guid column",
+];
+
+/// Strip a leading block of Anki `#` header lines, returning any
+/// `#separator:` delimiter it declares and the remaining bytes.
+/// Only lines at the very top are headers; a `#` after data is a card.
+fn strip_anki_headers(bytes: &[u8]) -> (Option<u8>, &[u8]) {
+    let mut delim = None;
+    let mut offset = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        3
+    } else {
+        0
+    };
+    while offset < bytes.len() {
+        let line_end = bytes[offset..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(bytes.len(), |p| offset + p);
+        let line = bytes[offset..line_end]
+            .strip_suffix(b"\r")
+            .unwrap_or(&bytes[offset..line_end]);
+        // Only Anki's own `#key:value` lines are headers, so a first card
+        // such as "#1 hit song" is kept.
+        let Some((key, value)) = std::str::from_utf8(line)
+            .ok()
+            .and_then(|text| text.strip_prefix('#'))
+            .and_then(|text| text.split_once(':'))
+        else {
+            break;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        if !ANKI_HEADER_KEYS.contains(&key.as_str()) {
+            break;
+        }
+        if key == "separator" && delim.is_none() {
+            delim = parse_separator_value(value.trim());
+        }
+        offset = if line_end < bytes.len() {
+            line_end + 1
+        } else {
+            bytes.len()
+        };
+    }
+    (delim, &bytes[offset..])
+}
+
+fn parse_separator_value(value: &str) -> Option<u8> {
+    match value.to_ascii_lowercase().as_str() {
+        "tab" => Some(b'\t'),
+        "comma" => Some(b','),
+        "semicolon" => Some(b';'),
+        "space" => Some(b' '),
+        "pipe" => Some(b'|'),
+        "colon" => Some(b':'),
+        _ => {
+            let mut chars = value.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) if c.is_ascii() => Some(c as u8),
+                _ => None,
+            }
+        }
+    }
+}
+
 /// Parse `front<delim>back` records (extra columns join the back).
 /// A leading `front,back` style header row is skipped.
 pub fn parse_delimited(bytes: &[u8], delimiter: u8) -> Result<Vec<Card>> {
+    let (header_delim, bytes) = strip_anki_headers(bytes);
+    let delimiter = header_delim.unwrap_or(delimiter);
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(false)
         .flexible(true)
