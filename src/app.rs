@@ -25,6 +25,9 @@ pub struct RunkiApp {
     revealed: bool,
     mode: Mode,
     later: HashSet<String>,
+    /// Set when the study-later file could not be read: toggles still
+    /// update `later` in memory but must not overwrite the file.
+    later_save_blocked: bool,
     error: Option<String>,
 }
 
@@ -36,6 +39,7 @@ impl RunkiApp {
             revealed: false,
             mode: Mode::All,
             later: HashSet::new(),
+            later_save_blocked: false,
             error: None,
         };
         if let Some(path) = initial_deck {
@@ -47,12 +51,26 @@ impl RunkiApp {
     fn open_path(&mut self, path: PathBuf) {
         match deck::load_deck(&path) {
             Ok(deck) => {
-                self.later = deck::load_later(&deck.path);
+                match deck::load_later(&deck.path) {
+                    Ok(later) => {
+                        self.later = later;
+                        self.later_save_blocked = false;
+                        self.error = None;
+                    }
+                    Err(err) => {
+                        self.later = HashSet::new();
+                        self.later_save_blocked = true;
+                        self.error = Some(format!(
+                            "{err:#}. The study-later list could not be read, so \
+                             flags in this session won't be saved until the file \
+                             is fixed or removed."
+                        ));
+                    }
+                }
                 self.deck = Some(deck);
                 self.pos = 0;
                 self.revealed = false;
                 self.mode = Mode::All;
-                self.error = None;
             }
             Err(err) => {
                 self.error = Some(format!("{err:#}"));
@@ -115,9 +133,11 @@ impl RunkiApp {
         if !self.later.insert(card.id.clone()) {
             self.later.remove(&card.id);
         }
-        if let Some(deck) = &self.deck {
-            if let Err(err) = deck::save_later(&deck.path, &self.later) {
-                self.error = Some(format!("{err:#}"));
+        if !self.later_save_blocked {
+            if let Some(deck) = &self.deck {
+                if let Err(err) = deck::save_later(&deck.path, &self.later) {
+                    self.error = Some(format!("{err:#}"));
+                }
             }
         }
         // Unflagging while reviewing the later list shrinks the view;
@@ -335,6 +355,7 @@ mod tests {
             revealed,
             mode,
             later: later.iter().map(|id| (*id).to_string()).collect(),
+            later_save_blocked: false,
             error: None,
         }
     }
@@ -398,5 +419,73 @@ mod tests {
         assert!(!app.later.contains("a"));
         let (card, _, _) = app.current().expect("card shown");
         assert_eq!(card.id, "a");
+    }
+
+    #[test]
+    fn corrupt_later_file_is_not_overwritten_by_toggle() {
+        let dir = std::env::temp_dir().join(format!(
+            "runki-test-corrupt-later-toggle-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let deck_path = dir.join("deck.tsv");
+        std::fs::write(&deck_path, "Q1\tA1\nQ2\tA2\n").expect("write deck");
+        let corrupt = "not valid json {{{";
+        let sidecar = crate::deck::later_path(&deck_path);
+        std::fs::write(&sidecar, corrupt).expect("write corrupt sidecar");
+
+        let mut app = RunkiApp::new(Some(deck_path));
+        assert!(app.deck.is_some(), "deck still opens");
+        assert!(app.later_save_blocked);
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|e| e.contains("could not be read")),
+            "error should explain saving is blocked: {:?}",
+            app.error
+        );
+
+        app.toggle_later();
+
+        assert_eq!(app.later.len(), 1, "toggle still updates in-memory list");
+        assert_eq!(
+            std::fs::read_to_string(&sidecar).expect("read sidecar"),
+            corrupt,
+            "corrupt file must be unchanged on disk"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn opening_good_deck_resets_later_save_blocked() {
+        let dir = std::env::temp_dir().join(format!(
+            "runki-test-corrupt-later-reset-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let bad_path = dir.join("bad.tsv");
+        std::fs::write(&bad_path, "Q1\tA1\n").expect("write bad deck");
+        std::fs::write(crate::deck::later_path(&bad_path), "not valid json {{{")
+            .expect("write corrupt sidecar");
+        let good_path = dir.join("good.tsv");
+        std::fs::write(&good_path, "Q1\tA1\n").expect("write good deck");
+
+        let mut app = RunkiApp::new(Some(bad_path));
+        assert!(app.later_save_blocked);
+
+        app.open_path(good_path.clone());
+        assert!(!app.later_save_blocked);
+        assert!(app.error.is_none());
+
+        app.toggle_later();
+        assert!(
+            crate::deck::later_path(&good_path).exists(),
+            "toggle saves after the flag is reset"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
