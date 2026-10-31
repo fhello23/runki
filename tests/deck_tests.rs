@@ -10,7 +10,10 @@ fn clean_html_strips_markup() {
         "Bold & italic\nnext line"
     );
     assert_eq!(clean_html("<div>one</div><div>two</div>"), "one\ntwo");
-    assert_eq!(clean_html("capital is {{c1::Paris::city}}"), "capital is Paris");
+    assert_eq!(
+        clean_html("capital is {{c1::Paris::city}}"),
+        "capital is Paris"
+    );
     assert_eq!(clean_html("listen [sound:fr.mp3] now"), "listen  now");
     assert_eq!(clean_html("a &lt; b &#38;&#x26; c"), "a < b && c");
     assert_eq!(clean_html("<img src=\"x.png\">"), "[image]");

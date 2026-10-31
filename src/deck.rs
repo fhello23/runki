@@ -78,10 +78,9 @@ pub fn load_deck(path: &Path) -> Result<Deck> {
 }
 
 fn load_apkg(path: &Path) -> Result<Vec<Card>> {
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("Could not open {}", path.display()))?;
-    let mut archive =
-        zip::ZipArchive::new(file).context("Not a valid .apkg (zip) file")?;
+    let file =
+        std::fs::File::open(path).with_context(|| format!("Could not open {}", path.display()))?;
+    let mut archive = zip::ZipArchive::new(file).context("Not a valid .apkg (zip) file")?;
 
     // Newest first: modern Anki also ships a dummy `collection.anki2`
     // holding a "requires a newer version" placeholder note, so it must
@@ -263,10 +262,7 @@ pub fn parse_delimited(bytes: &[u8], delimiter: u8) -> Result<Vec<Card>> {
             .filter(|f| !f.is_empty())
             .collect::<Vec<_>>()
             .join("\n\n");
-        if i == 0
-            && front.eq_ignore_ascii_case("front")
-            && back.eq_ignore_ascii_case("back")
-        {
+        if i == 0 && front.eq_ignore_ascii_case("front") && back.eq_ignore_ascii_case("back") {
             continue;
         }
         if front.is_empty() && back.is_empty() {
@@ -419,9 +415,7 @@ fn strip_tags(input: &str) -> String {
         match name {
             "br" => out.push('\n'),
             "img" => out.push_str("[image]"),
-            "div" | "p" | "li" | "tr" | "h1" | "h2" | "h3" | "h4"
-                if tag.starts_with('/') =>
-            {
+            "div" | "p" | "li" | "tr" | "h1" | "h2" | "h3" | "h4" if tag.starts_with('/') => {
                 out.push('\n')
             }
             _ => {}
@@ -495,4 +489,3 @@ fn tidy(input: &str) -> String {
     }
     lines.join("\n")
 }
-

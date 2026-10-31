@@ -146,12 +146,7 @@ impl RunkiApp {
 impl eframe::App for RunkiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Drag-and-drop a deck file onto the window to open it.
-        let dropped = ctx.input(|i| {
-            i.raw
-                .dropped_files
-                .iter()
-                .find_map(|f| f.path.clone())
-        });
+        let dropped = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
         if let Some(path) = dropped {
             self.open_path(path);
         }
@@ -159,8 +154,7 @@ impl eframe::App for RunkiApp {
         // Consume Space/L before widgets see them, so a focused button
         // cannot also trigger on Space and double-advance.
         let space = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space));
-        let later_key =
-            ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::L));
+        let later_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::L));
         if space {
             self.space();
         }
@@ -234,19 +228,16 @@ impl RunkiApp {
                     } else {
                         "Study later  (L)"
                     };
-                    let button = egui::Button::new(egui::RichText::new(label).size(18.0))
-                        .selected(flagged);
+                    let button =
+                        egui::Button::new(egui::RichText::new(label).size(18.0)).selected(flagged);
                     if ui.add(button).clicked() {
                         self.toggle_later();
                     }
                 });
                 if let Some((_, n, total)) = &current {
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            ui.label(format!("{n} / {total}"));
-                        },
-                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(format!("{n} / {total}"));
+                    });
                 }
             });
         });
@@ -266,9 +257,7 @@ impl RunkiApp {
                     if self.deck.is_none() {
                         ui.heading("Runki");
                         ui.add_space(8.0);
-                        ui.label(
-                            "Open an .apkg, .csv, or .tsv deck, or drop the file here.",
-                        );
+                        ui.label("Open an .apkg, .csv, or .tsv deck, or drop the file here.");
                         ui.add_space(4.0);
                         ui.label("Space: show answer / next card.  L: study later.");
                         ui.add_space(16.0);
@@ -299,18 +288,12 @@ impl RunkiApp {
                         ui.small("STUDY LATER");
                         ui.add_space(8.0);
                     }
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(&card.front).size(30.0))
-                            .wrap(),
-                    );
+                    ui.add(egui::Label::new(egui::RichText::new(&card.front).size(30.0)).wrap());
                     if self.revealed {
                         ui.add_space(16.0);
                         ui.separator();
                         ui.add_space(16.0);
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(&card.back).size(26.0))
-                                .wrap(),
-                        );
+                        ui.add(egui::Label::new(egui::RichText::new(&card.back).size(26.0)).wrap());
                     }
                     ui.add_space(24.0);
                 });
@@ -331,8 +314,8 @@ mod tests {
         pos: usize,
         revealed: bool,
     ) -> RunkiApp {
-        let dir = std::env::temp_dir()
-            .join(format!("runki-test-{}-{}", test_name, std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("runki-test-{}-{}", test_name, std::process::id()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let cards = ["a", "b", "c"]
             .into_iter()
@@ -358,13 +341,7 @@ mod tests {
 
     #[test]
     fn later_unflag_first_hides_next_cards_answer() {
-        let mut app = test_app(
-            "later-unflag-first",
-            &["a", "b", "c"],
-            Mode::Later,
-            0,
-            true,
-        );
+        let mut app = test_app("later-unflag-first", &["a", "b", "c"], Mode::Later, 0, true);
 
         app.toggle_later();
 
@@ -423,4 +400,3 @@ mod tests {
         assert_eq!(card.id, "a");
     }
 }
-
