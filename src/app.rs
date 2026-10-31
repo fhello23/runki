@@ -37,6 +37,10 @@ pub struct RunkiApp {
     dirty: bool,
     last_save_attempt: Option<Instant>,
     error: Option<String>,
+    /// Error from the last save attempt; cleared by the next
+    /// successful save. Kept apart from `error` so a background save
+    /// never hides an unrelated message.
+    save_error: Option<String>,
 }
 
 impl RunkiApp {
@@ -52,6 +56,7 @@ impl RunkiApp {
             dirty: false,
             last_save_attempt: None,
             error: None,
+            save_error: None,
         };
         if let Some(path) = initial_deck {
             app.open_path(path);
@@ -62,18 +67,27 @@ impl RunkiApp {
     fn open_path(&mut self, path: PathBuf) {
         match deck::load_deck(&path) {
             Ok(deck) => {
-                // Always save the outgoing deck's progress first.
+                // Always save the outgoing deck's progress first, and
+                // say so if that failed: its unsaved changes are lost.
                 self.save_now();
+                let outgoing_error = self.save_error.take().map(|err| {
+                    let name = self.deck.as_ref().map_or("the previous deck", |d| &d.name);
+                    format!("Progress for {name} could not be saved: {err}")
+                });
                 let state_path = progress::state_path(&deck.path, None);
                 let outcome = progress::load(&deck.path, &state_path);
                 self.save_blocked = outcome.is_blocked();
-                self.error = match &outcome {
+                let load_error = match &outcome {
                     LoadOutcome::Blocked { error, .. } => Some(format!(
                         "{error:#}. Progress could not be read, so \
                          changes in this session won't be saved until the file \
                          is fixed or removed."
                     )),
                     _ => None,
+                };
+                self.error = match (outgoing_error, load_error) {
+                    (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
+                    (a, b) => a.or(b),
                 };
                 // A migrated state only exists in memory until saved.
                 self.dirty = outcome.is_migrated();
@@ -114,10 +128,10 @@ impl RunkiApp {
             Ok(merged) => {
                 self.state = merged;
                 self.dirty = false;
-                self.error = None;
+                self.save_error = None;
             }
             Err(err) => {
-                self.error = Some(format!("{err:#}"));
+                self.save_error = Some(format!("{err:#}"));
             }
         }
     }
@@ -365,15 +379,17 @@ impl RunkiApp {
 
     fn central(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            if let Some(error) = self.error.clone() {
-                ui.add_space(16.0);
-                ui.horizontal(|ui| {
-                    ui.colored_label(egui::Color32::LIGHT_RED, error);
-                    if ui.small_button("×").clicked() {
-                        self.error = None;
-                    }
-                });
-                ui.add_space(16.0);
+            for slot in [&mut self.error, &mut self.save_error] {
+                if let Some(error) = slot.clone() {
+                    ui.add_space(16.0);
+                    ui.horizontal(|ui| {
+                        ui.colored_label(egui::Color32::LIGHT_RED, error);
+                        if ui.small_button("×").clicked() {
+                            *slot = None;
+                        }
+                    });
+                    ui.add_space(16.0);
+                }
             }
 
             let Some(current) = self.current() else {
@@ -480,6 +496,7 @@ mod tests {
             dirty: false,
             last_save_attempt: None,
             error: None,
+            save_error: None,
         };
         (app, guard)
     }
@@ -553,14 +570,47 @@ mod tests {
 
         app.toggle_later();
         app.save_now();
-        assert!(app.error.is_some(), "failed save should set error");
+        assert!(app.save_error.is_some(), "failed save should set error");
         assert!(app.dirty, "failed save stays dirty for a retry");
 
         std::fs::remove_dir_all(&sidecar).expect("remove blocking dir");
         app.toggle_later();
         app.save_now();
-        assert_eq!(app.error, None, "successful save should clear error");
+        assert_eq!(app.save_error, None, "successful save should clear error");
         assert!(!app.dirty);
+    }
+
+    #[test]
+    fn successful_save_keeps_unrelated_error() {
+        let (mut app, _temp) = test_app("save-keeps-error", &[], Mode::All, 0, false);
+        app.error = Some("Could not open other.apkg".to_string());
+
+        app.toggle_later();
+        app.save_now();
+
+        assert!(!app.dirty);
+        assert_eq!(app.error.as_deref(), Some("Could not open other.apkg"));
+    }
+
+    #[test]
+    fn failed_save_on_deck_switch_is_reported() {
+        let (mut app, temp) = test_app("switch-save-fails", &[], Mode::All, 0, false);
+        let deck_path = app.deck.as_ref().expect("deck").path.clone();
+        // Make saving the outgoing deck fail.
+        std::fs::create_dir_all(progress::state_path(&deck_path, None))
+            .expect("create blocking dir");
+        app.toggle_later();
+        let next = temp.0.join("next.tsv");
+        std::fs::write(&next, "Q\tA\n").expect("write next deck");
+
+        app.open_path(next);
+
+        let error = app.error.as_deref().expect("lost progress is reported");
+        assert!(
+            error.contains("Progress for test could not be saved"),
+            "{error}"
+        );
+        assert_eq!(app.save_error, None);
     }
 
     #[test]
