@@ -1,28 +1,66 @@
-//! egui front-end: one card at a time.
+//! egui front-end: a library screen, then one card at a time.
 //!
+//! - The start screen is the library: the decks in one folder
+//!   (see [`crate::library`]). Clicking a deck opens the study
+//!   screen; **Library** in its top bar goes back.
 //! - `Space` shows the answer, then moves to the next card (wrapping
 //!   around at the end, so browsing never stops).
 //! - `L` toggles the current card in the study-later list.
-//! - The top bar picks the card order (deck order or shuffled) and
-//!   which cards to show (all, unseen only, or study-later only).
+//! - The study top bar picks the card order (deck order or shuffled)
+//!   and which cards to show (all, unseen only, or study-later only).
 //!
 //! Study logic (order, filter, position, saving) lives in
-//! [`crate::session::StudySession`]; this module keeps the save
-//! debounce, error banners, file picker, and drag-and-drop.
+//! [`crate::session::StudySession`]; this module keeps the config,
+//! save debounce, error banners, file pickers, and drag-and-drop.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 
 use crate::deck::{self, Card};
+use crate::library::{self, DeckEntry, DeckStatus, LibraryLoader};
 use crate::progress::{self, CardFilter, CardOrder, LoadOutcome};
 use crate::session::StudySession;
 
 /// How often a dirty state is written while studying.
 const SAVE_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Storage key for [`Config`] in eframe's persistent storage.
+pub const CONFIG_KEY: &str = "runki_config";
+
+/// Per-machine app config (not synced): which folder is the library
+/// and which deck was opened last. Stored via eframe persistence
+/// (loaded from `cc.storage` in `main`, saved in [`eframe::App::save`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Config {
+    /// The library folder, if one has been chosen.
+    #[serde(default)]
+    pub library: Option<PathBuf>,
+    /// The deck most recently opened, from anywhere.
+    #[serde(default)]
+    pub last_open_deck: Option<PathBuf>,
+}
+
+/// Which screen is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Screen {
+    Library,
+    Study,
+}
+
 pub struct RunkiApp {
+    config: Config,
+    screen: Screen,
+    /// Rows from the latest library scan, with loader summaries
+    /// applied as they arrive.
+    library_entries: Vec<DeckEntry>,
+    /// Why the latest scan failed (missing/unreadable folder).
+    library_error: Option<String>,
+    /// Created on the first frame, when an egui context is at hand
+    /// for its repaint callback.
+    loader: Option<LibraryLoader>,
     session: Option<StudySession>,
     last_save_attempt: Option<Instant>,
     /// The reset-progress confirmation dialog is open.
@@ -35,18 +73,40 @@ pub struct RunkiApp {
 }
 
 impl RunkiApp {
-    pub fn new(initial_deck: Option<PathBuf>) -> Self {
+    /// Start on the library screen, unless `initial_deck` (a CLI
+    /// argument) opens straight into the study screen. The last
+    /// open deck is *not* auto-reopened: the library is the start
+    /// screen; `last_open_deck` is only remembered in the config.
+    /// A CLI argument is the only thing that wins over it, by
+    /// construction.
+    pub fn new(config: Config, initial_deck: Option<PathBuf>) -> Self {
         let mut app = Self {
+            config,
+            screen: Screen::Library,
+            library_entries: Vec::new(),
+            library_error: None,
+            loader: None,
             session: None,
             last_save_attempt: None,
             show_reset_confirm: false,
             error: None,
             save_error: None,
         };
+        app.rescan_library();
         if let Some(path) = initial_deck {
             app.open_path(path);
         }
         app
+    }
+
+    /// The current config (what `App::save` persists).
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// The screen currently showing.
+    pub fn screen(&self) -> Screen {
+        self.screen
     }
 
     fn open_path(&mut self, path: PathBuf) {
@@ -60,7 +120,9 @@ impl RunkiApp {
                     let name = outgoing_name.as_deref().unwrap_or("the previous deck");
                     format!("Progress for {name} could not be saved: {err}")
                 });
-                let state_path = progress::state_path(&deck.path, None);
+                // A deck in the library uses the library state file
+                // however it was opened; others use a sidecar.
+                let state_path = progress::state_path(&deck.path, self.config.library.as_deref());
                 let outcome = progress::load(&deck.path, &state_path);
                 let save_blocked = outcome.is_blocked();
                 let load_error = match &outcome {
@@ -76,6 +138,7 @@ impl RunkiApp {
                     (a, b) => a.or(b),
                 };
                 let state = outcome.into_state();
+                self.config.last_open_deck = Some(deck.path.clone());
                 self.session = Some(StudySession::new(
                     deck,
                     state,
@@ -84,6 +147,7 @@ impl RunkiApp {
                     progress::now_ms(),
                 ));
                 self.show_reset_confirm = false;
+                self.screen = Screen::Study;
             }
             Err(err) => {
                 self.error = Some(format!("{err:#}"));
@@ -150,6 +214,141 @@ impl RunkiApp {
         }
     }
 
+    /// Re-scan the library folder; rows appear at once and the
+    /// background loader fills in their counts.
+    fn rescan_library(&mut self) {
+        let Some(dir) = self.config.library.clone() else {
+            self.library_entries.clear();
+            self.library_error = None;
+            return;
+        };
+        match library::scan(&dir) {
+            Ok(entries) => {
+                self.library_entries = entries;
+                self.library_error = None;
+                self.start_loader();
+            }
+            Err(err) => {
+                self.library_entries.clear();
+                self.library_error = Some(format!("{err:#}"));
+            }
+        }
+    }
+
+    /// (Re)start the background loader for the current rows, once
+    /// it exists (it is created on the first frame).
+    fn start_loader(&self) {
+        if let (Some(loader), Some(dir)) = (&self.loader, &self.config.library) {
+            let paths = self
+                .library_entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect();
+            loader.start(dir, paths);
+        }
+    }
+
+    /// Create the loader on the first frame, wiring its repaint
+    /// callback to this window, and start it for the scanned rows.
+    fn ensure_loader(&mut self, ctx: &egui::Context) {
+        if self.loader.is_none() {
+            let ctx = ctx.clone();
+            self.loader = Some(LibraryLoader::new(Box::new(move || {
+                ctx.request_repaint();
+            })));
+            self.start_loader();
+        }
+    }
+
+    /// Fold arrived background summaries into the rows.
+    fn apply_summaries(&mut self) {
+        let Some(loader) = &self.loader else { return };
+        let summaries = loader.drain();
+        if summaries.is_empty() {
+            return;
+        }
+        for summary in summaries {
+            if let Some(entry) = self
+                .library_entries
+                .iter_mut()
+                .find(|entry| entry.path == summary.path)
+            {
+                entry.status = summary.status;
+                entry.opened_at = summary.opened_at;
+            }
+        }
+        library::sort_entries(&mut self.library_entries);
+    }
+
+    /// Point the library at `dir` and show it.
+    fn set_library(&mut self, dir: PathBuf) {
+        self.config.library = Some(dir);
+        self.screen = Screen::Library;
+        self.rescan_library();
+    }
+
+    fn choose_library_folder(&mut self) {
+        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+            self.set_library(dir);
+        }
+    }
+
+    /// Use one of the suggested `…/Runki` folders, creating it first.
+    fn choose_suggested_library(&mut self, dir: PathBuf) {
+        match std::fs::create_dir_all(&dir) {
+            Ok(()) => self.set_library(dir),
+            Err(err) => {
+                self.error = Some(format!("Could not create {}: {err}", dir.display()));
+            }
+        }
+    }
+
+    /// "Add deck…": copy picked files into the library.
+    fn add_decks_via_picker(&mut self) {
+        if let Some(paths) = rfd::FileDialog::new()
+            .add_filter("Decks", &["apkg", "csv", "tsv", "txt"])
+            .pick_files()
+        {
+            self.add_to_library(paths);
+        }
+    }
+
+    /// Copy each file into the library (carrying progress over),
+    /// report any failures, then rescan.
+    fn add_to_library(&mut self, paths: Vec<PathBuf>) {
+        let Some(dir) = self.config.library.clone() else {
+            return;
+        };
+        let errors: Vec<String> = paths
+            .iter()
+            .filter_map(|path| {
+                library::add_deck(&dir, path)
+                    .err()
+                    .map(|err| format!("{err:#}"))
+            })
+            .collect();
+        if !errors.is_empty() {
+            self.error = Some(errors.join("\n"));
+        }
+        self.rescan_library();
+    }
+
+    /// Back to the library: save first (reporting failure like a
+    /// deck switch does, since the session is dropped), then rescan
+    /// so the rows show the progress just made.
+    fn go_to_library(&mut self) {
+        let outgoing_name = self.session.as_ref().map(|s| s.deck().name.clone());
+        self.save_now();
+        if let Some(err) = self.save_error.take() {
+            let name = outgoing_name.as_deref().unwrap_or("the previous deck");
+            self.error = Some(format!("Progress for {name} could not be saved: {err}"));
+        }
+        self.session = None;
+        self.show_reset_confirm = false;
+        self.screen = Screen::Library;
+        self.rescan_library();
+    }
+
     /// The card on screen with its `(n, view_len)` position.
     fn current(&self) -> Option<(&Card, usize, usize)> {
         let session = self.session.as_ref()?;
@@ -174,32 +373,56 @@ impl RunkiApp {
 }
 
 impl eframe::App for RunkiApp {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.save_now();
+        eframe::set_value(storage, CONFIG_KEY, &self.config);
+    }
+
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.save_now();
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Drag-and-drop a deck file onto the window to open it.
-        let dropped = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
-        if let Some(path) = dropped {
-            self.open_path(path);
+        self.ensure_loader(ctx);
+        self.apply_summaries();
+
+        // Drag-and-drop: onto the library screen copies files in;
+        // onto the study screen opens the first one (as before).
+        // Without a library folder there is nothing to copy into,
+        // so opening is the fallback there too.
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        if !dropped.is_empty() {
+            if self.screen == Screen::Library && self.config.library.is_some() {
+                self.add_to_library(dropped);
+            } else if let Some(path) = dropped.into_iter().next() {
+                self.open_path(path);
+            }
         }
 
-        // Consume Space/L before widgets see them, so a focused button
-        // cannot also trigger on Space and double-advance. While the
-        // reset confirmation is open they are consumed but ignored.
-        let space = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space));
-        let later_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::L));
-        let escape = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
-        if escape {
-            self.show_reset_confirm = false;
-        }
-        if !self.show_reset_confirm {
-            if space {
-                self.space();
+        if self.screen == Screen::Study {
+            // Consume Space/L before widgets see them, so a focused
+            // button cannot also trigger on Space and double-advance.
+            // While the reset confirmation is open they are consumed
+            // but ignored.
+            let space = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space));
+            let later_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::L));
+            let escape = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+            if escape {
+                self.show_reset_confirm = false;
             }
-            if later_key {
-                self.toggle_later();
+            if !self.show_reset_confirm {
+                if space {
+                    self.space();
+                }
+                if later_key {
+                    self.toggle_later();
+                }
             }
         }
 
@@ -209,17 +432,35 @@ impl eframe::App for RunkiApp {
             ctx.request_repaint_after(delay);
         }
 
-        self.top_bar(ctx);
-        self.bottom_bar(ctx);
-        self.central(ctx);
-        self.reset_confirm(ctx);
+        match self.screen {
+            Screen::Library => {
+                self.library_top_bar(ctx);
+                self.library_central(ctx);
+            }
+            Screen::Study => {
+                self.top_bar(ctx);
+                // The Library button may have just switched screens;
+                // only draw the rest of the study screen if not.
+                if self.screen == Screen::Study {
+                    self.bottom_bar(ctx);
+                    self.central(ctx);
+                    self.reset_confirm(ctx);
+                } else {
+                    self.library_central(ctx);
+                }
+            }
+        }
     }
 }
 
 impl RunkiApp {
     fn top_bar(&mut self, ctx: &egui::Context) {
+        let mut go_back = false;
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
+                if ui.button("Library").clicked() {
+                    go_back = true;
+                }
                 if ui.button("Open deck...").clicked() {
                     self.pick_and_open();
                 }
@@ -287,6 +528,9 @@ impl RunkiApp {
                 }
             });
         });
+        if go_back {
+            self.go_to_library();
+        }
     }
 
     fn bottom_bar(&mut self, ctx: &egui::Context) {
@@ -330,20 +574,175 @@ impl RunkiApp {
         });
     }
 
-    fn central(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            for slot in [&mut self.error, &mut self.save_error] {
-                if let Some(error) = slot.clone() {
-                    ui.add_space(16.0);
-                    ui.horizontal(|ui| {
-                        ui.colored_label(egui::Color32::LIGHT_RED, error);
-                        if ui.small_button("×").clicked() {
-                            *slot = None;
+    fn library_top_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("library_top").show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Library");
+                match &self.config.library {
+                    Some(dir) => {
+                        ui.label(dir.display().to_string());
+                        if ui.button("Change folder…").clicked() {
+                            self.choose_library_folder();
                         }
-                    });
-                    ui.add_space(16.0);
+                        if ui.button("Add deck…").clicked() {
+                            self.add_decks_via_picker();
+                        }
+                        if ui.button("Refresh").clicked() {
+                            self.rescan_library();
+                        }
+                    }
+                    None => {
+                        ui.label("No library folder chosen");
+                    }
+                }
+                ui.separator();
+                if ui.button("Open deck…").clicked() {
+                    self.pick_and_open();
+                }
+            });
+        });
+    }
+
+    fn library_central(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            self.banners(ui);
+            if self.config.library.is_none() {
+                self.welcome(ui);
+                return;
+            }
+            if let Some(error) = self.library_error.clone() {
+                ui.add_space(16.0);
+                ui.colored_label(egui::Color32::LIGHT_RED, error);
+                ui.add_space(16.0);
+                if ui.button("Choose another folder…").clicked() {
+                    self.choose_library_folder();
+                }
+                return;
+            }
+            self.library_list(ui);
+        });
+    }
+
+    /// First-launch view: pick a library folder (with synced-folder
+    /// shortcuts), or just open a one-off deck.
+    fn welcome(&mut self, ui: &mut egui::Ui) {
+        ui.vertical_centered(|ui| {
+            ui.add_space(80.0);
+            ui.heading("Runki");
+            ui.add_space(8.0);
+            ui.label(
+                "Choose a library folder for your decks. Decks and progress \
+                 live there, so a folder synced by Dropbox or iCloud Drive \
+                 follows you between Macs.",
+            );
+            ui.add_space(16.0);
+            if ui
+                .add(egui::Button::new(
+                    egui::RichText::new("Choose a library folder…").size(20.0),
+                ))
+                .clicked()
+            {
+                self.choose_library_folder();
+            }
+            for dir in library::suggested_library_folders() {
+                ui.add_space(8.0);
+                if ui
+                    .button(format!("Use {}", dir.display()))
+                    .on_hover_text("Create this folder and use it as the library")
+                    .clicked()
+                {
+                    self.choose_suggested_library(dir);
                 }
             }
+            ui.add_space(24.0);
+            ui.label("Or open a deck file without a library:");
+            ui.add_space(8.0);
+            if ui.button("Open deck…").clicked() {
+                self.pick_and_open();
+            }
+        });
+    }
+
+    /// The scrollable deck list. Clicking a ready row opens it.
+    fn library_list(&mut self, ui: &mut egui::Ui) {
+        if self.library_entries.is_empty() {
+            ui.add_space(16.0);
+            ui.label("No decks in this folder yet. Use “Add deck…”, or drop deck files here.");
+            return;
+        }
+        let now = progress::now_ms();
+        let mut to_open: Option<PathBuf> = None;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for entry in &self.library_entries {
+                let ready = matches!(entry.status, DeckStatus::Ready { .. });
+                let row = ui.horizontal_wrapped(|ui| {
+                    ui.strong(&entry.display_name);
+                    match &entry.status {
+                        DeckStatus::Loading => {
+                            ui.spinner();
+                            ui.label("Loading…");
+                        }
+                        DeckStatus::Ready { total, seen, later } => {
+                            let fraction = if *total == 0 {
+                                0.0
+                            } else {
+                                *seen as f32 / *total as f32
+                            };
+                            ui.add(
+                                egui::ProgressBar::new(fraction)
+                                    .desired_width(140.0)
+                                    .text(format!("{seen} / {total}")),
+                            );
+                            ui.label(format!("{total} cards"));
+                            ui.label(format!("{later} for later"));
+                            ui.label(format!(
+                                "Last opened: {}",
+                                library::last_opened_label(entry.opened_at, now)
+                            ));
+                        }
+                        DeckStatus::Failed(error) => {
+                            ui.colored_label(egui::Color32::LIGHT_RED, error);
+                        }
+                        DeckStatus::NotDownloaded => {
+                            ui.weak("Not downloaded – open in Finder to download");
+                        }
+                    }
+                });
+                let response = row.response.interact(egui::Sense::click());
+                if ready {
+                    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if response.clicked() {
+                        to_open = Some(entry.path.clone());
+                    }
+                }
+                ui.separator();
+            }
+        });
+        if let Some(path) = to_open {
+            self.open_path(path);
+        }
+    }
+
+    /// Dismissable red banners for `error` and `save_error`,
+    /// shared by both screens.
+    fn banners(&mut self, ui: &mut egui::Ui) {
+        for slot in [&mut self.error, &mut self.save_error] {
+            if let Some(error) = slot.clone() {
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    ui.colored_label(egui::Color32::LIGHT_RED, error);
+                    if ui.small_button("×").clicked() {
+                        *slot = None;
+                    }
+                });
+                ui.add_space(16.0);
+            }
+        }
+    }
+
+    fn central(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            self.banners(ui);
 
             let Some(current) = self.current() else {
                 ui.vertical_centered(|ui| {
@@ -501,6 +900,11 @@ mod tests {
             1_000,
         );
         let app = RunkiApp {
+            config: Config::default(),
+            screen: Screen::Study,
+            library_entries: Vec::new(),
+            library_error: None,
+            loader: None,
             session: Some(session),
             last_save_attempt: None,
             show_reset_confirm: false,
@@ -614,7 +1018,7 @@ mod tests {
         let second = dir.join("second.tsv");
         std::fs::write(&second, "Q2\tA2\n").expect("write second deck");
 
-        let mut app = RunkiApp::new(Some(first.clone()));
+        let mut app = RunkiApp::new(Config::default(), Some(first.clone()));
         assert!(
             session(&app).state().opened_at > 0,
             "opening stamps opened_at"
@@ -649,7 +1053,7 @@ mod tests {
         std::fs::write(&legacy, corrupt).expect("write corrupt legacy file");
         let state_path = progress::state_path(&deck_path, None);
 
-        let mut app = RunkiApp::new(Some(deck_path));
+        let mut app = RunkiApp::new(Config::default(), Some(deck_path));
         assert!(app.session.is_some(), "deck still opens");
         assert!(session(&app).save_blocked());
         assert!(
@@ -692,7 +1096,7 @@ mod tests {
         let state_path = progress::state_path(&deck_path, None);
         std::fs::write(&state_path, corrupt).expect("write corrupt state");
 
-        let mut app = RunkiApp::new(Some(deck_path));
+        let mut app = RunkiApp::new(Config::default(), Some(deck_path));
         assert!(session(&app).save_blocked());
 
         app.toggle_later();
@@ -724,7 +1128,7 @@ mod tests {
         let good_path = dir.join("good.tsv");
         std::fs::write(&good_path, "Q1\tA1\n").expect("write good deck");
 
-        let mut app = RunkiApp::new(Some(bad_path));
+        let mut app = RunkiApp::new(Config::default(), Some(bad_path));
         assert!(session(&app).save_blocked());
 
         app.open_path(good_path.clone());
@@ -739,5 +1143,108 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn library_deck_opened_by_path_uses_runki_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "runki-test-library-state-path-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("create library");
+        let deck_path = library.join("deck.tsv");
+        std::fs::write(&deck_path, "Q1\tA1\n").expect("write deck");
+
+        let config = Config {
+            library: Some(library.clone()),
+            last_open_deck: None,
+        };
+        // Opened by path (as a CLI deck would be), not via a row click.
+        let mut app = RunkiApp::new(config, Some(deck_path.clone()));
+        assert_eq!(app.screen(), Screen::Study);
+        assert_eq!(app.config().last_open_deck.as_ref(), Some(&deck_path));
+
+        let library_state = library.join(".runki").join("deck.tsv.json");
+        assert_eq!(session(&app).state_path(), &library_state);
+
+        app.toggle_later();
+        app.save_now();
+        assert!(library_state.exists(), "progress saved under .runki/");
+        assert!(
+            !progress::state_path(&deck_path, None).exists(),
+            "no sidecar for a library deck"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn starts_on_library_and_goes_back_with_rescan() {
+        let dir =
+            std::env::temp_dir().join(format!("runki-test-start-screen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("create library");
+        let deck_path = library.join("deck.tsv");
+        std::fs::write(&deck_path, "Q1\tA1\n").expect("write deck");
+
+        let config = Config {
+            library: Some(library.clone()),
+            last_open_deck: Some(deck_path.clone()),
+        };
+        // Even with a remembered deck, the start screen is the
+        // library (only a CLI deck auto-opens), already scanned.
+        let mut app = RunkiApp::new(config, None);
+        assert_eq!(app.screen(), Screen::Library);
+        assert!(app.session.is_none());
+        assert_eq!(app.library_entries.len(), 1);
+        assert_eq!(app.library_entries[0].display_name, "deck");
+        assert!(app.library_error.is_none());
+
+        app.open_path(deck_path.clone());
+        assert_eq!(app.screen(), Screen::Study);
+        app.space(); // Mark the only card seen.
+
+        app.go_to_library();
+        assert_eq!(app.screen(), Screen::Library);
+        assert!(app.session.is_none());
+        assert_eq!(app.library_entries.len(), 1, "rescanned on the way back");
+        assert!(
+            app.library_entries[0].opened_at > 0,
+            "rescan picked up the saved opened_at"
+        );
+        let saved = progress::load(
+            &deck_path,
+            &progress::state_path(&deck_path, Some(&library)),
+        );
+        assert!(
+            saved.state().seen.values().any(|&t| t > 0),
+            "going back saved the session"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_library_folder_is_shown_as_error() {
+        let dir =
+            std::env::temp_dir().join(format!("runki-test-missing-library-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = Config {
+            library: Some(dir),
+            last_open_deck: None,
+        };
+        let app = RunkiApp::new(config, None);
+        assert_eq!(app.screen(), Screen::Library);
+        assert!(
+            app.library_error
+                .as_deref()
+                .is_some_and(|e| e.contains("Could not read library folder")),
+            "scan failure is kept for the library view: {:?}",
+            app.library_error
+        );
+        assert!(app.library_entries.is_empty());
     }
 }
