@@ -5,6 +5,7 @@
 # Runki
 
 [![CI](https://github.com/fhello23/runki/actions/workflows/ci.yml/badge.svg)](https://github.com/fhello23/runki/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/fhello23/runki)](https://github.com/fhello23/runki/releases/latest)
 
 </div>
 
@@ -12,13 +13,76 @@ A minimal Anki deck viewer written in Rust. No spaced repetition, no
 grading, no limits: open a deck and spacebar through it for as long as
 you want. The only extra is a "study later" list.
 
-## Run
+## Install
+
+Download the latest version from the
+[Releases page](https://github.com/fhello23/runki/releases/latest).
+No Rust needed.
+
+### macOS (Apple Silicon and Intel, macOS 11 or later)
+
+1. Download `Runki-<version>-macos.zip` and unzip it.
+2. Drag `Runki.app` into **Applications**.
+3. Open it. The first time, macOS says it cannot check Runki for
+   malware, because the app is not notarized by Apple (that needs a
+   paid developer account). Click **Done**, then go to **System
+   Settings → Privacy & Security**, scroll down, and click **Open
+   Anyway** next to Runki. You only need to do this once per version.
+
+   Or, from Terminal:
+
+   ```sh
+   xattr -dr com.apple.quarantine /Applications/Runki.app
+   ```
+
+To open a deck straight away from Terminal:
+
+```sh
+/Applications/Runki.app/Contents/MacOS/runki path/to/deck.apkg
+```
+
+### Linux (x86_64)
+
+```sh
+tar -xzf runki-<version>-linux-x86_64.tar.gz
+cd runki-<version>-linux-x86_64
+./runki                        # opens the library
+./runki path/to/deck.apkg
+```
+
+To run `runki` from any folder, move it onto your `PATH`, e.g.
+`sudo mv runki /usr/local/bin/`.
+
+### From source
+
+With [Rust](https://rustup.rs) installed:
 
 ```sh
 cargo run --release            # opens the library
 cargo run --release -- path/to/deck.apkg
 cargo run --release -- sample-deck.tsv
 ```
+
+Or install it as a `runki` command (in `~/.cargo/bin`), either from a
+checkout or straight from a release tag:
+
+```sh
+cargo install --path . --locked
+cargo install --git https://github.com/fhello23/runki --tag v0.2.0 --locked
+```
+
+## Version
+
+Runki follows [Semantic Versioning](https://semver.org/). The version
+is shown on the library and start screens and in **Runki → About
+Runki** on macOS, and printed by:
+
+```sh
+runki --version                # runki 0.2.0
+runki --help
+```
+
+What changed in each version is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Library
 
@@ -121,3 +185,45 @@ is designed to be safe:
 - Reversed cards generated from the same note are shown once.
 - Cards loop forever in the chosen order. "Seen" is only a checkmark:
   no scheduling, grading, or stats beyond the seen count.
+- On macOS, decks are opened from inside Runki (or dropped onto its
+  window), not by double-clicking them in Finder or dropping them on
+  the Dock icon.
+
+## Releasing
+
+The version lives only in `Cargo.toml`; everything else reads it
+from there. While working, each PR that changes what users see adds a
+line under **Unreleased** in [CHANGELOG.md](CHANGELOG.md).
+
+To publish a release:
+
+1. In a PR, bump `version` in `Cargo.toml` (patch for fixes, minor for
+   features, while Runki is `0.x`), run `cargo check` so `Cargo.lock`
+   follows, and rename **Unreleased** in the changelog to
+   `[X.Y.Z] - <date>` (leave an empty **Unreleased** above it and
+   update the compare links at the bottom).
+2. Merge it, then tag that commit on `main` and push the tag:
+
+   ```sh
+   git checkout main && git pull
+   git tag vX.Y.Z
+   git push origin vX.Y.Z
+   ```
+
+3. The [Release workflow](.github/workflows/release.yml) checks that
+   the tag matches `Cargo.toml`, builds `Runki.app` (one universal
+   build for Apple Silicon and Intel, ad-hoc signed) and a Linux
+   binary, and publishes a GitHub Release with that version's
+   changelog notes. If the tag and `Cargo.toml` disagree, or the
+   changelog has no notes for the version, nothing is published:
+   delete the tag (`git push --delete origin vX.Y.Z`), fix it, and tag
+   again.
+
+Pull requests that change the release workflow or
+`scripts/bundle-macos.sh` run the builds too (without publishing).
+To build the macOS app locally:
+
+```sh
+cargo build --release
+scripts/bundle-macos.sh target/release/runki target/dist   # → target/dist/Runki.app
+```

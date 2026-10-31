@@ -1,0 +1,130 @@
+name: Release
+
+# Pushing a vX.Y.Z tag builds Runki for macOS and Linux and publishes a
+# GitHub Release with those downloads and the version's CHANGELOG notes.
+# Pull requests that touch the release files only build, to prove they work.
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - scripts/bundle-macos.sh
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  notes:
+    name: Check version and collect notes
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        name: Read the version from Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+      - name: Extract this version's CHANGELOG section
+        run: |
+          version='${{ steps.version.outputs.version }}'
+          awk -v v="$version" '
+            /^## / { if (found) exit; if (index($0, "## [" v "]") == 1) { found = 1; next } }
+            /^\[[^]]*\]: / { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "::error::CHANGELOG.md has no notes under ## [$version]"
+            exit 1
+          fi
+          cat notes.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: notes
+          path: notes.md
+
+  macos:
+    name: Build macOS app
+    needs: notes
+    runs-on: macos-latest
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked --target aarch64-apple-darwin
+      - run: cargo build --release --locked --target x86_64-apple-darwin
+      - name: Package Runki.app (Apple Silicon and Intel)
+        run: |
+          mkdir -p dist
+          lipo -create -output dist/runki \
+            target/aarch64-apple-darwin/release/runki \
+            target/x86_64-apple-darwin/release/runki
+          scripts/bundle-macos.sh dist/runki dist
+          dist/Runki.app/Contents/MacOS/runki --version
+          ditto -c -k --keepParent dist/Runki.app \
+            "dist/Runki-${{ needs.notes.outputs.version }}-macos.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*.zip
+
+  linux:
+    name: Build Linux binary
+    needs: notes
+    # The oldest supported runner, so the binary runs on older glibc too.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - name: Package runki
+        run: |
+          name="runki-${{ needs.notes.outputs.version }}-linux-x86_64"
+          mkdir -p "dist/$name"
+          cp target/release/runki README.md LICENSE CHANGELOG.md "dist/$name/"
+          "dist/$name/runki" --version
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*.tar.gz
+
+  publish:
+    name: Publish GitHub Release
+    if: github.ref_type == 'tag'
+    needs: [notes, macos, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Runki ${{ needs.notes.outputs.version }}" \
+            --notes-file artifacts/notes/notes.md \
+            artifacts/macos/*.zip artifacts/linux/*.tar.gz

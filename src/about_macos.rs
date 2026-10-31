@@ -1,9 +1,10 @@
 //! The macOS "About Runki" panel.
 //!
 //! winit adds an About item to the app menu that opens the bare standard
-//! panel. Runki runs as a plain binary rather than an `.app` bundle, so that
-//! panel has no icon, version or licence to show. `install` points the item
-//! at the same standard panel, filled in with Runki's own details.
+//! panel. Run with `cargo run`, Runki is a plain binary rather than an `.app`
+//! bundle, so that panel has no icon, version or licence to show; even the
+//! release bundle's `Info.plist` has no licence or link. `install` points the
+//! item at the same standard panel, filled in with Runki's own details.
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
@@ -79,7 +80,7 @@ pub fn install() {
 fn show_panel(mtm: MainThreadMarker) {
     let icon = NSImage::initWithData(NSImage::alloc(), &NSData::with_bytes(ICON_PNG));
     let name = NSString::from_str("Runki");
-    let version = NSString::from_str(env!("CARGO_PKG_VERSION"));
+    let version = NSString::from_str(runki::VERSION);
     // An empty build version hides the "(…)" after the version.
     let build = NSString::from_str("");
     let copyright = NSString::from_str(COPYRIGHT);
