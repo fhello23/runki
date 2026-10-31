@@ -15,12 +15,35 @@ you want. The only extra is a "study later" list.
 ## Run
 
 ```sh
-cargo run --release            # then click "Open deck..."
+cargo run --release            # opens the library
 cargo run --release -- path/to/deck.apkg
 cargo run --release -- sample-deck.tsv
 ```
 
-You can also drag a deck file onto the window.
+## Library
+
+Runki opens on a library screen: the decks in one folder, each with
+its card count, `seen / total` progress, study-later count, and when
+you last opened it (most recent first). On first launch you pick the
+folder — shortcuts are offered for a `Runki` folder inside Dropbox or
+iCloud Drive when those exist. Because decks and progress both live
+in the folder, putting it in Dropbox or iCloud Drive syncs everything
+between Macs; any local folder works too. The folder can be changed
+later with **Change folder…**, and the choice is remembered per Mac.
+
+- **Add deck…** (or dropping files onto the library screen) *copies*
+  a deck into the library — never overwriting: a name clash becomes
+  `name (2).apkg`, `name (3).apkg`, … Any progress the source deck
+  already has is carried over to the copy.
+- Clicking a deck opens it; **Library** in the study top bar goes
+  back. **Refresh** re-reads the folder (e.g. after a sync).
+- A deck that fails to parse (say, a stray notes `.txt`) stays listed
+  with its error instead of failing the whole list.
+- Decks can still be opened without a library — from the command
+  line, **Open deck…**, or by dropping a file on the study screen —
+  and keep working exactly as before.
+
+You can also drag a deck file onto the study window to open it.
 
 ## Keys
 
@@ -28,6 +51,7 @@ You can also drag a deck file onto the window.
 | --- | --- |
 | `Space` | Show the answer; press again for the next card (wraps around at the end) |
 | `L` | Toggle the current card in the study-later list |
+| **Library** | Save and go back to the library screen |
 | **Order:** `Deck order` / `Shuffled` | Show cards as they are in the deck, or in a shuffled order |
 | **Reshuffle** (shuffled only) | Pick a new shuffle; the card on screen stays |
 | **Show:** `All` / `Unseen` / `Study later (n)` | Show every card, only cards you have not seen yet, or only flagged cards |
@@ -56,8 +80,14 @@ card's place in the shown list.
 
 Study-later flags, which cards you have seen (a card becomes seen
 when its answer is revealed), and where you left off — the current
-card, order, filter, and shuffle — are saved next to the deck in
-`<deck>.runki.json`, so they survive restarts and sync with the deck.
+card, order, filter, and shuffle — are saved with the deck, so they
+survive restarts and sync with it:
+
+- A deck in the library keeps its progress in the library's `.runki/`
+  folder (`<library>/.runki/<deck>.json`), however it was opened.
+- A deck outside the library keeps its progress in a
+  `<deck>.runki.json` sidecar next to the deck file.
+
 Reopening a deck resumes at the remembered card.
 Delete that file to clear a deck's progress. A legacy
 `<deck>.later.json` from older versions is imported once into the new
