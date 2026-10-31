@@ -142,10 +142,17 @@ described below, so switching interfaces resumes the same session.
 ## Web interface
 
 Study from a phone or another browser on the same network. Choose a library
-folder in Runki, then click **Web** in the desktop library or press `w` in
-the TUI (library or study screen). Open the displayed `http://…:8765/` URL
-on your phone. Keep Runki running; turning Web off or quitting stops the
-server. The desktop also shows a localhost URL for this computer.
+folder in Runki, then open **Web: Off** / **Web: On** in either desktop
+screen's top bar and enable **Web server on**. The same configuration pane
+shows the LAN address, **Copy URL**, a localhost address, and an editable
+port. In the TUI, press `w` in the library or study screen. Open the displayed
+`http://…:8765/` URL on your phone. Keep Runki running; turning Web off or
+quitting stops the server.
+
+On macOS, the **Runki** app menu also has a checked **Web Server** toggle.
+The address item below it copies the LAN URL when clicked; when the server
+is off it is disabled and labelled **Web Server Off**. These menu items
+follow the in-app controls and current port.
 
 **Anyone on this network can study and change progress.** There is no
 login, PIN or encryption. Use Web only on a trusted network; do not forward
@@ -163,9 +170,17 @@ runki --no-web
 ```
 
 `--web`, `--no-web` and `--web-port` do not change the remembered settings.
-Using the in-app toggle remembers its new on/off choice; a CLI port override
-still lasts only for that run. If the port is busy, Web stays off and shows
-an error.
+Using either desktop toggle or TUI `w` remembers its new on/off choice.
+A CLI port override still lasts only for that run unless you deliberately
+edit the port in the desktop Web pane and click **Apply**. Apply accepts only
+digits from `1` to `65535` and remembers the new port for both interfaces,
+including the TUI on its next launch.
+
+When Web is on, Apply restarts it on the new port; reconnect using the new
+address. If the new port is busy, Runki restores the old listener and shows
+an error without changing the remembered port. If restoring the old listener
+also fails, Web turns off. Starting Web on a busy port likewise leaves it
+off with an error.
 
 The browser can browse the library, reveal and advance cards, toggle study
 later, change order and filters, reshuffle, and reset seen progress. Decks

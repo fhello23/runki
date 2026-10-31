@@ -213,8 +213,10 @@ fn run_gui(
         "Runki",
         options,
         Box::new(move |cc| {
+            let web_bridge = std::sync::Arc::new(runki::web_menu::WebMenuBridge::default());
+            web_bridge.set_context(cc.egui_ctx.clone());
             #[cfg(target_os = "macos")]
-            about_macos::install();
+            about_macos::install(std::sync::Arc::clone(&web_bridge));
             theme::install(&cc.egui_ctx);
             let choice = theme::load(cc.storage);
             cc.egui_ctx.set_theme(choice);
@@ -230,6 +232,7 @@ fn run_gui(
             }
             Ok(Box::new(
                 RunkiApp::new_with_web_options(config, initial_deck, web)
+                    .with_web_bridge(web_bridge)
                     .with_theme(choice)
                     .with_config_path(config_path),
             ))

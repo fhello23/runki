@@ -27,6 +27,7 @@ use crate::progress::{self, CardFilter, CardOrder, LoadOutcome};
 use crate::session::StudySession;
 use crate::theme::{self, Palette};
 use crate::web::{LibrarySlot, WebOptions, WebServer, WARNING};
+use crate::web_menu::{WebMenuBridge, WebMenuStatus};
 use crate::VERSION;
 
 /// How often a dirty state is written while studying.
@@ -58,6 +59,8 @@ pub struct RunkiApp {
     library_slot: LibrarySlot,
     web: Option<WebServer>,
     web_port: u16,
+    web_port_input: String,
+    web_bridge: Arc<WebMenuBridge>,
     web_error: Option<String>,
     config: Config,
     config_path: Option<PathBuf>,
@@ -82,6 +85,17 @@ pub struct RunkiApp {
     save_error: Option<String>,
 }
 
+fn parse_web_port(input: &str) -> Option<u16> {
+    if input.is_empty() || !input.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    input.parse::<u16>().ok().filter(|&port| port != 0)
+}
+
+fn web_port_field_id() -> egui::Id {
+    egui::Id::new("web_port")
+}
+
 impl RunkiApp {
     /// Start on the library screen, unless `initial_deck` (a CLI
     /// argument) opens straight into the study screen. The last
@@ -99,10 +113,13 @@ impl RunkiApp {
         options: WebOptions,
     ) -> Self {
         let web_on = options.on.unwrap_or(config.web_on);
+        let web_port = options.port.unwrap_or(config.web_port);
         let mut app = Self {
             library_slot: Arc::new(RwLock::new(config.library.clone())),
             web: None,
-            web_port: options.port.unwrap_or(config.web_port),
+            web_port,
+            web_port_input: web_port.to_string(),
+            web_bridge: Arc::new(WebMenuBridge::default()),
             web_error: None,
             config,
             config_path: None,
@@ -120,6 +137,7 @@ impl RunkiApp {
         if web_on {
             app.start_web();
         }
+        app.publish_web_status();
         app.rescan_library();
         if let Some(path) = initial_deck {
             app.open_path(path);
@@ -144,6 +162,81 @@ impl RunkiApp {
             self.start_web();
         }
         self.config.web_on = self.web.is_some();
+        self.publish_web_status();
+    }
+
+    pub fn with_web_bridge(mut self, bridge: Arc<WebMenuBridge>) -> Self {
+        self.web_bridge = bridge;
+        self.publish_web_status();
+        self
+    }
+
+    fn publish_web_status(&self) {
+        self.web_bridge.publish(WebMenuStatus {
+            on: self.web.is_some(),
+            lan_url: self.web.as_ref().map(|server| server.lan_url().to_owned()),
+            port: self.web_port,
+        });
+    }
+
+    fn handle_web_menu_requests(&mut self) {
+        for _ in 0..self.web_bridge.take_toggle_requests() {
+            self.toggle_web();
+        }
+    }
+
+    fn apply_web_port(&mut self) {
+        self.apply_web_port_with(WebServer::start);
+    }
+
+    fn apply_web_port_with(
+        &mut self,
+        mut start: impl FnMut(LibrarySlot, u16) -> anyhow::Result<WebServer>,
+    ) {
+        let Some(port) = parse_web_port(&self.web_port_input).filter(|&port| port != self.web_port)
+        else {
+            return;
+        };
+        if let Some(mut previous) = self.web.take() {
+            let stop_error = previous
+                .stop()
+                .err()
+                .map(|err| format!("Previous Web progress could not be saved: {err:#}"));
+            drop(previous);
+            match start(Arc::clone(&self.library_slot), port) {
+                Ok(server) => {
+                    self.web = Some(server);
+                    self.web_port = port;
+                    self.config.web_port = port;
+                    self.web_error = stop_error;
+                }
+                Err(err) => {
+                    let mut error = format!("Could not use Web port {port}: {err:#}");
+                    match start(Arc::clone(&self.library_slot), self.web_port) {
+                        Ok(server) => {
+                            self.web = Some(server);
+                            error.push_str(&format!(". Still serving on port {}.", self.web_port));
+                        }
+                        Err(rollback) => {
+                            self.config.web_on = false;
+                            error.push_str(&format!(
+                                ". Could not restore port {}: {rollback:#}. Web is off.",
+                                self.web_port
+                            ));
+                        }
+                    }
+                    if let Some(stop_error) = stop_error {
+                        error.push_str(&format!("\n{stop_error}"));
+                    }
+                    self.web_error = Some(error);
+                }
+            }
+        } else {
+            self.web_port = port;
+            self.config.web_port = port;
+            self.web_error = None;
+        }
+        self.publish_web_status();
     }
 
     /// Start with this theme choice (as loaded from the app config).
@@ -416,6 +509,31 @@ impl RunkiApp {
         }
     }
 
+    fn study_shortcuts(&mut self, ctx: &egui::Context) {
+        if self.screen == Screen::Study
+            && !ctx.memory(|memory| memory.has_focus(web_port_field_id()))
+        {
+            // Consume Space/L before widgets see them, so a focused
+            // button cannot also trigger on Space and double-advance.
+            // While the reset confirmation is open they are consumed
+            // but ignored.
+            let space = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space));
+            let later_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::L));
+            let escape = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+            if escape {
+                self.show_reset_confirm = false;
+            }
+            if !self.show_reset_confirm {
+                if space {
+                    self.space();
+                }
+                if later_key {
+                    self.toggle_later();
+                }
+            }
+        }
+    }
+
     /// L: toggle the current card in the study-later list.
     fn toggle_later(&mut self) {
         if let Some(session) = &mut self.session {
@@ -448,9 +566,11 @@ impl eframe::App for RunkiApp {
                 eprintln!("runki: Web progress could not be saved: {err:#}");
             }
         }
+        self.publish_web_status();
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_web_menu_requests();
         self.ensure_loader(ctx);
         self.apply_summaries();
 
@@ -473,26 +593,7 @@ impl eframe::App for RunkiApp {
             }
         }
 
-        if self.screen == Screen::Study {
-            // Consume Space/L before widgets see them, so a focused
-            // button cannot also trigger on Space and double-advance.
-            // While the reset confirmation is open they are consumed
-            // but ignored.
-            let space = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space));
-            let later_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::L));
-            let escape = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
-            if escape {
-                self.show_reset_confirm = false;
-            }
-            if !self.show_reset_confirm {
-                if space {
-                    self.space();
-                }
-                if later_key {
-                    self.toggle_later();
-                }
-            }
-        }
+        self.study_shortcuts(ctx);
 
         // Debounced save, with a repaint scheduled so a pending save
         // happens even without further input.
@@ -551,6 +652,64 @@ impl RunkiApp {
         }
     }
 
+    fn web_menu(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let label = if self.web.is_some() {
+            "Web: On"
+        } else {
+            "Web: Off"
+        };
+        egui::menu::menu_custom_button(
+            ui,
+            egui::Button::new(label).selected(self.web.is_some()),
+            |ui| {
+                ui.set_width(310.0);
+                let mut on = self.web.is_some();
+                if ui.checkbox(&mut on, "Web server on").changed() {
+                    self.toggle_web();
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Port");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.web_port_input)
+                            .id(web_port_field_id())
+                            .desired_width(85.0),
+                    );
+                    let port = parse_web_port(&self.web_port_input);
+                    if ui
+                        .add_enabled(
+                            port.is_some_and(|port| port != self.web_port),
+                            egui::Button::new("Apply"),
+                        )
+                        .clicked()
+                    {
+                        self.apply_web_port();
+                    }
+                });
+                if parse_web_port(&self.web_port_input).is_none() {
+                    ui.label(
+                        egui::RichText::new("Enter a port from 1 to 65535 (digits only).")
+                            .small()
+                            .color(p.danger),
+                    );
+                }
+                if let Some(server) = &self.web {
+                    ui.separator();
+                    ui.add(egui::Label::new(server.lan_url()).selectable(true));
+                    if ui.button("Copy URL").clicked() {
+                        ui.ctx().copy_text(server.lan_url().to_owned());
+                    }
+                    ui.add(egui::Label::new(server.localhost_url()).selectable(true));
+                    ui.label(egui::RichText::new(WARNING).small().color(p.muted));
+                }
+                if let Some(error) = &self.web_error {
+                    ui.separator();
+                    ui.add(egui::Label::new(egui::RichText::new(error).color(p.danger)).wrap());
+                }
+            },
+        );
+    }
+
     fn top_bar(&mut self, ctx: &egui::Context, p: &Palette) {
         let mut go_back = false;
         egui::TopBottomPanel::top("top")
@@ -560,6 +719,7 @@ impl RunkiApp {
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         self.theme_button(ui, p);
+                        self.web_menu(ui, p);
                         if ui.button("Open deck…").clicked() {
                             self.pick_and_open();
                         }
@@ -675,6 +835,7 @@ impl RunkiApp {
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         self.theme_button(ui, p);
+                        self.web_menu(ui, p);
                         ui.label(
                             egui::RichText::new(format!("v{VERSION}"))
                                 .size(12.0)
@@ -685,25 +846,6 @@ impl RunkiApp {
                         });
                     });
                 });
-                ui.horizontal_wrapped(|ui| {
-                    if ui.selectable_label(self.web.is_some(), "Web").clicked() {
-                        self.toggle_web();
-                    }
-                    if let Some(server) = &self.web {
-                        ui.add(egui::Label::new(server.lan_url()).selectable(true));
-                        if ui.small_button("Copy URL").clicked() {
-                            ui.ctx().copy_text(server.lan_url().to_owned());
-                        }
-                        ui.label(
-                            egui::RichText::new(server.localhost_url())
-                                .small()
-                                .color(p.muted),
-                        );
-                    }
-                });
-                if self.web.is_some() {
-                    ui.label(egui::RichText::new(WARNING).small().color(p.muted));
-                }
                 if let Some(dir) = self.config.library.clone() {
                     ui.add(
                         egui::Label::new(
@@ -1336,6 +1478,8 @@ mod tests {
             library_slot: Arc::new(RwLock::new(None)),
             web: None,
             web_port: 8765,
+            web_port_input: "8765".into(),
+            web_bridge: Arc::new(WebMenuBridge::default()),
             web_error: None,
             config: Config::default(),
             config_path: None,
@@ -1857,5 +2001,278 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("Could not start Web"));
+    }
+
+    fn unused_web_port() -> u16 {
+        std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    fn running_web_app() -> RunkiApp {
+        let port = unused_web_port();
+        let app = RunkiApp::new(
+            Config {
+                web_on: true,
+                web_port: port,
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(app.web.is_some(), "{:?}", app.web_error);
+        app
+    }
+
+    #[test]
+    fn web_port_validation_matches_cli_rules_and_invalid_edits_do_not_apply() {
+        for (input, expected) in [("1", 1), ("8765", 8765), ("65535", 65535), ("00080", 80)] {
+            assert_eq!(parse_web_port(input), Some(expected));
+        }
+        let mut app = RunkiApp::new(Config::default(), None);
+        for input in [
+            "",
+            "0",
+            "65536",
+            "port",
+            "-1",
+            "+1",
+            " 80",
+            "80 ",
+            "8.0",
+            "８０",
+            "999999999999999999999999",
+        ] {
+            assert_eq!(parse_web_port(input), None, "{input:?}");
+            app.web_port_input = input.into();
+            app.apply_web_port_with(|_, _| panic!("invalid port must not start Web"));
+            assert_eq!(app.web_port, 8765);
+            assert_eq!(app.config.web_port, 8765);
+            assert!(app.web.is_none());
+        }
+    }
+
+    #[test]
+    fn applying_web_port_while_off_is_remembered_by_shared_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut app = RunkiApp::new_with_web_options(
+            Config::default(),
+            None,
+            WebOptions {
+                on: Some(false),
+                port: Some(9000),
+            },
+        )
+        .with_config_path(path.clone());
+        assert_eq!(app.web_port_input, "9000");
+        app.web_port_input = "9100".into();
+        app.apply_web_port();
+        assert!(app.web.is_none());
+        assert_eq!(app.web_port, 9100);
+        assert_eq!(app.config.web_port, 9100);
+        assert_eq!(app.web_bridge.status().port, 9100);
+        let mut storage = MemoryStorage::default();
+        eframe::App::save(&mut app, &mut storage);
+        // The TUI loads this same config on its next launch.
+        assert_eq!(crate::config::load(&path).unwrap().unwrap().web_port, 9100);
+        assert_eq!(
+            eframe::get_value::<Config>(&storage, CONFIG_KEY)
+                .unwrap()
+                .web_port,
+            9100
+        );
+    }
+
+    #[test]
+    fn applying_web_port_while_on_moves_listener_and_publishes_address() {
+        let mut app = running_web_app();
+        let old_port = app.web_port;
+        let port = unused_web_port();
+        app.web_port_input = port.to_string();
+        app.apply_web_port();
+        assert_eq!(app.web_port, port);
+        assert_eq!(app.config.web_port, port);
+        assert!(app.config.web_on);
+        assert!(app.web_error.is_none());
+        assert_eq!(app.web.as_ref().unwrap().local_addr.port(), port);
+        assert!(std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).is_ok());
+        assert!(std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).is_err());
+        let _old =
+            std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, old_port)).unwrap();
+        let status = app.web_bridge.status();
+        assert!(status.on);
+        assert_eq!(status.port, port);
+        assert_eq!(
+            status.lan_url.as_deref(),
+            Some(app.web.as_ref().unwrap().lan_url())
+        );
+    }
+
+    #[test]
+    fn applying_occupied_web_port_restores_old_listener_and_remembered_port() {
+        let occupied = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let mut app = running_web_app();
+        let old_port = app.web_port;
+        // Exercise a temporary CLI override that differs from the remembered port.
+        app.config.web_port = 4321;
+        app.web_port_input = port.to_string();
+        app.apply_web_port();
+        assert_eq!(app.web_port, old_port);
+        assert_eq!(app.config.web_port, 4321);
+        assert!(app.config.web_on);
+        assert_eq!(app.web.as_ref().unwrap().local_addr.port(), old_port);
+        assert!(std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, old_port)).is_ok());
+        assert!(std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, old_port)).is_err());
+        assert!(app
+            .web_error
+            .as_deref()
+            .unwrap()
+            .contains(&format!("Could not use Web port {port}")));
+        assert!(app
+            .web_error
+            .as_deref()
+            .unwrap()
+            .contains(&format!("Still serving on port {old_port}")));
+        assert!(app.web_bridge.status().on);
+        assert_eq!(app.web_bridge.status().port, old_port);
+    }
+
+    #[test]
+    fn failed_web_port_apply_and_rollback_turn_web_off_without_remembering_new_port() {
+        let mut app = running_web_app();
+        let old_port = app.web_port;
+        let port = unused_web_port();
+        app.web_port_input = port.to_string();
+        let mut attempts = Vec::new();
+        app.apply_web_port_with(|_, port| {
+            attempts.push(port);
+            Err(anyhow::anyhow!("simulated bind failure"))
+        });
+        assert_eq!(attempts, [port, old_port]);
+        assert!(app.web.is_none());
+        assert!(!app.config.web_on);
+        assert_eq!(app.config.web_port, old_port);
+        assert_eq!(app.web_port, old_port);
+        assert!(!app.web_bridge.status().on);
+        assert!(app.web_bridge.status().lan_url.is_none());
+        assert!(app
+            .web_error
+            .as_deref()
+            .unwrap()
+            .contains("Could not restore port"));
+        let _released =
+            std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, old_port)).unwrap();
+    }
+
+    #[test]
+    fn cli_web_port_stays_temporary_without_deliberate_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let config = Config {
+            web_port: 4321,
+            ..Default::default()
+        };
+        let mut app = RunkiApp::new_with_web_options(
+            config.clone(),
+            None,
+            WebOptions {
+                on: Some(false),
+                port: Some(9000),
+            },
+        )
+        .with_config_path(path.clone());
+        assert_eq!(app.web_port, 9000);
+        assert_eq!(app.web_port_input, "9000");
+        let mut storage = MemoryStorage::default();
+        eframe::App::save(&mut app, &mut storage);
+        assert_eq!(crate::config::load(&path).unwrap(), Some(config.clone()));
+        assert_eq!(
+            eframe::get_value::<Config>(&storage, CONFIG_KEY),
+            Some(config)
+        );
+    }
+
+    #[test]
+    fn native_menu_requests_use_gui_toggle_and_publish_actual_state() {
+        let bridge = Arc::new(WebMenuBridge::default());
+        let mut app = RunkiApp::new(
+            Config {
+                web_port: unused_web_port(),
+                ..Default::default()
+            },
+            None,
+        )
+        .with_web_bridge(Arc::clone(&bridge));
+        bridge.request_toggle();
+        assert!(app.web.is_none(), "menu callback only records intent");
+        app.handle_web_menu_requests();
+        assert!(app.web.is_some());
+        assert!(app.config.web_on);
+        assert!(bridge.status().on);
+        assert_eq!(
+            bridge.status().lan_url.as_deref(),
+            Some(app.web.as_ref().unwrap().lan_url())
+        );
+        app.handle_web_menu_requests();
+        assert!(app.web.is_some(), "request is not consumed twice");
+        bridge.request_toggle();
+        app.handle_web_menu_requests();
+        assert!(app.web.is_none());
+        assert!(!app.config.web_on);
+        assert!(!bridge.status().on);
+        assert!(bridge.status().lan_url.is_none());
+    }
+
+    #[test]
+    fn editing_web_port_does_not_consume_study_shortcuts() {
+        let (mut app, _temp) = test_app("web-port-focus", &[]);
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.add(egui::TextEdit::singleline(&mut app.web_port_input).id(web_port_field_id()))
+                    .request_focus();
+            });
+        });
+        let keys = || {
+            vec![egui::Key::Space, egui::Key::L]
+                .into_iter()
+                .map(|key| egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                })
+                .collect()
+        };
+        let _ = ctx.run(
+            egui::RawInput {
+                events: keys(),
+                ..Default::default()
+            },
+            |ctx| {
+                assert!(ctx.memory(|memory| memory.has_focus(web_port_field_id())));
+                app.study_shortcuts(ctx);
+                assert!(!session(&app).revealed());
+                assert_eq!(session(&app).later_count(), 0);
+                assert!(ctx.input(|input| input.key_pressed(egui::Key::Space)));
+                assert!(ctx.input(|input| input.key_pressed(egui::Key::L)));
+                ctx.memory_mut(|memory| memory.surrender_focus(web_port_field_id()));
+            },
+        );
+        let _ = ctx.run(
+            egui::RawInput {
+                events: keys(),
+                ..Default::default()
+            },
+            |ctx| {
+                app.study_shortcuts(ctx);
+                assert!(session(&app).revealed());
+                assert_eq!(session(&app).later_count(), 1);
+            },
+        );
     }
 }

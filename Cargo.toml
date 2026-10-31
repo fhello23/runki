@@ -25,8 +25,8 @@ tempfile = "3"
 zip = "2"
 zstd = "0.13"
 
-# The macOS "About Runki" panel (src/about_macos.rs). Already in the tree via
-# eframe and rfd; only the AppKit classes the panel uses are enabled.
+# The macOS About panel and web menu (src/about_macos.rs). Already in the
+# tree via eframe and rfd; only the AppKit classes these controls use are enabled.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6", optional = true }
 objc2-app-kit = { version = "0.3", optional = true, default-features = false, features = [
@@ -35,11 +35,13 @@ objc2-app-kit = { version = "0.3", optional = true, default-features = false, fe
     "NSApplication",
     "NSAttributedString",
     "NSColor",
+    "NSCell",
     "NSFont",
     "NSImage",
     "NSMenu",
     "NSMenuItem",
     "NSParagraphStyle",
+    "NSPasteboard",
     "NSResponder",
     "NSText",
 ] }
