@@ -1,8 +1,12 @@
-<img src="assets/icon.png" alt="Runki icon" width="128" align="right">
+<div align="center">
+
+<img src="assets/icon.png" alt="Runki icon" width="128">
 
 # Runki
 
 [![CI](https://github.com/fhello23/runki/actions/workflows/ci.yml/badge.svg)](https://github.com/fhello23/runki/actions/workflows/ci.yml)
+
+</div>
 
 A minimal Anki deck viewer written in Rust. No spaced repetition, no
 grading, no limits: open a deck and spacebar through it for as long as
