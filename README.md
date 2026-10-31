@@ -113,20 +113,21 @@ You can also drag a deck file onto the study window to open it.
 
 | Key / button | Action |
 | --- | --- |
-| `Space` | Show the answer; press again for the next card (wraps around at the end) |
+| `Space` or click the card | Show the answer; press again for the next card (wraps around at the end) |
 | `L` | Toggle the current card in the study-later list |
 | **Library** | Save and go back to the library screen |
+| **Theme icon** (top right) | Cycle match system → light → dark; remembered between launches |
 | **Order:** `Deck order` / `Shuffled` | Show cards as they are in the deck, or in a shuffled order |
 | **Reshuffle** (shuffled only) | Pick a new shuffle; the card on screen stays |
-| **Show:** `All` / `Unseen` / `Study later (n)` | Show every card, only cards you have not seen yet, or only flagged cards |
+| **Show:** `All` / `Unseen` / `Later (n)` | Show every card, only cards you have not seen yet, or only flagged cards |
 
 Revealing a card's answer marks it seen. In `Unseen`, the card stays
 on screen until you move on. When every card has been seen, `Unseen`
 offers **Reset progress** (also available any time via **Reset…** next
 to the seen count, with a confirmation): seen marks are
-cleared, study-later flags are kept. The top bar shows how many cards
-you have seen (`seen / total`); the bottom bar shows the current
-card's place in the shown list.
+cleared, study-later flags are kept. Below the card, a thin progress
+bar shows its place in the shown list, alongside the deck's seen count
+and **Reset…** control.
 
 ## Deck formats
 

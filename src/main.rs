@@ -5,7 +5,7 @@ use std::process::ExitCode;
 mod about_macos;
 
 use runki::app::{Config, RunkiApp, CONFIG_KEY};
-use runki::VERSION;
+use runki::{theme, VERSION};
 
 const USAGE: &str = "\
 Usage: runki [DECK]
@@ -67,15 +67,21 @@ fn main() -> ExitCode {
 }
 
 fn run(initial_deck: Option<PathBuf>) -> eframe::Result<()> {
+    let viewport = eframe::egui::ViewportBuilder::default()
+        .with_app_id("runki")
+        .with_inner_size([900.0, 650.0])
+        .with_min_inner_size([520.0, 400.0])
+        .with_icon(
+            eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
+                .expect("assets/icon.png is a valid PNG"),
+        );
+    #[cfg(target_os = "macos")]
+    let viewport = viewport
+        .with_fullsize_content_view(true)
+        .with_titlebar_shown(false)
+        .with_title_shown(false);
     let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_app_id("runki")
-            .with_inner_size([900.0, 650.0])
-            .with_min_inner_size([520.0, 400.0])
-            .with_icon(
-                eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
-                    .expect("assets/icon.png is a valid PNG"),
-            ),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(
@@ -84,13 +90,18 @@ fn run(initial_deck: Option<PathBuf>) -> eframe::Result<()> {
         Box::new(move |cc| {
             #[cfg(target_os = "macos")]
             about_macos::install();
+            theme::install(&cc.egui_ctx);
+            let choice = theme::load(cc.storage);
+            cc.egui_ctx.set_theme(choice);
             // A CLI deck (initial_deck) wins over the saved config:
             // it alone opens straight into the study screen.
             let config: Config = cc
                 .storage
                 .and_then(|storage| eframe::get_value(storage, CONFIG_KEY))
                 .unwrap_or_default();
-            Ok(Box::new(RunkiApp::new(config, initial_deck)))
+            Ok(Box::new(
+                RunkiApp::new(config, initial_deck).with_theme(choice),
+            ))
         }),
     )
 }

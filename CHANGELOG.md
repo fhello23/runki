@@ -11,6 +11,12 @@ see. Releasing moves those lines under the new version (see
 
 ## [Unreleased]
 
+### Changed
+
+- A minimal library and study interface, centred cards, clickable
+  keyboard hints, and a top-right theme control for system, light or
+  dark appearance. The theme choice is remembered between launches.
+
 ## [0.2.0] - 2026-10-31
 
 The first published release. Builds before this one all called
