@@ -11,6 +11,8 @@ see. Releasing moves those lines under the new version (see
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-10-31
+
 ### Added
 
 - A full terminal interface (`runki --tui`): library browsing, adding
@@ -70,6 +72,7 @@ themselves 0.1.0 and were never released.
 The first, unreleased version: open an `.apkg`, `.csv`, `.tsv` or
 `.txt` deck, spacebar through it, and flag cards to study later.
 
-[Unreleased]: https://github.com/fhello23/runki/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/fhello23/runki/compare/v0.3.5...HEAD
+[0.3.5]: https://github.com/fhello23/runki/compare/v0.3.0...v0.3.5
 [0.3.0]: https://github.com/fhello23/runki/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/fhello23/runki/releases/tag/v0.2.0

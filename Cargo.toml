@@ -1,6 +1,6 @@
 [package]
 name = "runki"
-version = "0.3.0"
+version = "0.3.5"
 edition = "2021"
 description = "A minimal Anki deck viewer: spacebar through cards, flag some for later. No spaced repetition."
 license = "MIT"
