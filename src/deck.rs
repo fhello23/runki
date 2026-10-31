@@ -326,6 +326,15 @@ fn decode_entities(input: &str) -> String {
             continue;
         };
         let entity = &after[..semi];
+        let name = entity.strip_prefix('#').unwrap_or(entity);
+        if entity.len() > 32
+            || name.is_empty()
+            || !name.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        {
+            out.push('&');
+            rest = after;
+            continue;
+        }
         let decoded = match entity {
             "nbsp" => Some(" ".to_string()),
             "amp" => Some("&".to_string()),
@@ -335,6 +344,7 @@ fn decode_entities(input: &str) -> String {
             "apos" => Some("'".to_string()),
             _ => entity
                 .strip_prefix("#x")
+                .or_else(|| entity.strip_prefix("#X"))
                 .and_then(|h| u32::from_str_radix(h, 16).ok())
                 .or_else(|| entity.strip_prefix('#')?.parse::<u32>().ok())
                 .and_then(char::from_u32)
