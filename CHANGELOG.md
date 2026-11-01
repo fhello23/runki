@@ -11,6 +11,15 @@ see. Releasing moves those lines under the new version (see
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-01
+
+### Fixed
+
+- The study progress bar now shows the share of the deck seen
+  (`seen / total`) instead of the card's place in the shown list,
+  which on a resumed shuffle could look like progress not yet made.
+  The place in the list is still shown as text below the bar.
+
 ## [0.4.0] - 2026-10-31
 
 ### Added
@@ -82,7 +91,8 @@ themselves 0.1.0 and were never released.
 The first, unreleased version: open an `.apkg`, `.csv`, `.tsv` or
 `.txt` deck, spacebar through it, and flag cards to study later.
 
-[Unreleased]: https://github.com/fhello23/runki/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/fhello23/runki/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/fhello23/runki/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/fhello23/runki/compare/v0.3.5...v0.4.0
 [0.3.5]: https://github.com/fhello23/runki/compare/v0.3.0...v0.3.5
 [0.3.0]: https://github.com/fhello23/runki/compare/v0.2.0...v0.3.0
