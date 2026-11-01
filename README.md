@@ -70,7 +70,7 @@ checkout or straight from a release tag:
 
 ```sh
 cargo install --path . --locked
-cargo install --git https://github.com/fhello23/runki --tag v0.4.0 --locked
+cargo install --git https://github.com/fhello23/runki --tag v0.4.1 --locked
 ```
 
 ## Terminal interface
@@ -201,7 +201,7 @@ is shown on the library and start screens and in **Runki → About
 Runki** on macOS, and printed by:
 
 ```sh
-runki --version                # runki 0.4.0
+runki --version                # runki 0.4.1
 runki --help
 ```
 
