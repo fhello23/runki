@@ -249,8 +249,9 @@ on screen until you move on. When every card has been seen, `Unseen`
 offers **Reset progress** (also available any time via **Reset…** next
 to the seen count, with a confirmation): seen marks are
 cleared, study-later flags are kept. Below the card, a thin progress
-bar shows its place in the shown list, alongside the deck's seen count
-and **Reset…** control.
+bar shows the share of the deck seen (`seen / total`), alongside the
+deck's seen count and **Reset…** control; the card's place in the
+shown list is shown as text below it.
 
 ## Deck formats
 

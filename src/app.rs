@@ -965,7 +965,7 @@ impl RunkiApp {
                                                         ui.label(egui::RichText::new(format!("{later} for later")).size(12.0).color(if *later > 0 { p.accent } else { p.muted }));
                                                         ui.label(egui::RichText::new(format!("Last opened: {}", library::last_opened_label(entry.opened_at, now))).size(12.0).color(p.muted));
                                                     });
-                                                    let fraction = *seen as f32 / (*total).max(1) as f32;
+                                                    let fraction = seen_fraction(*seen, *total);
                                                     let (track, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 3.0), egui::Sense::hover());
                                                     ui.painter().rect_filled(track, 2, p.line);
                                                     if fraction > 0.0 {
@@ -1040,6 +1040,50 @@ impl RunkiApp {
             });
             ui.add_space(4.0);
         }
+    }
+
+    /// Below the card: a thin bar of % seen (`seen / deck total`)
+    /// with the seen count and **Reset…**, then the card's place in
+    /// the shown list as plain text. The bar is deliberately not
+    /// the place in the list: resuming a shuffled deck can start
+    /// far into the list (e.g. card 1412 of 3090) with few cards
+    /// seen, so a position bar would look like progress not made.
+    fn progress_row(&mut self, ui: &mut egui::Ui, p: &Palette, n: usize, view_len: usize) {
+        let Some(session) = &self.session else { return };
+        let seen = session.seen_count();
+        let total = session.total();
+        let fraction = study_progress_fraction(session);
+        centered_row(ui, |ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(96.0, 4.0), egui::Sense::hover());
+            ui.painter().rect_filled(rect, 2, p.line);
+            if fraction > 0.0 {
+                let fill = egui::Rect::from_min_size(
+                    rect.min,
+                    egui::vec2(rect.width() * fraction, rect.height()),
+                );
+                ui.painter().rect_filled(fill, 2, p.accent);
+            }
+            ui.label(
+                egui::RichText::new(format!("{seen} / {total} seen"))
+                    .size(12.0)
+                    .color(p.muted),
+            );
+            if seen > 0
+                && ui
+                    .small_button("Reset…")
+                    .on_hover_text("Clear which cards you have seen")
+                    .clicked()
+            {
+                self.show_reset_confirm = true;
+            }
+        });
+        centered_row(ui, |ui| {
+            ui.label(
+                egui::RichText::new(format!("Card {n} / {view_len}"))
+                    .size(12.0)
+                    .color(p.muted),
+            );
+        });
     }
 
     fn seen_row(&mut self, ui: &mut egui::Ui, p: &Palette) {
@@ -1140,8 +1184,7 @@ impl RunkiApp {
                                     flagged,
                                 );
                                 ui.add_space(12.0);
-                                progress_row(ui, p, n, total);
-                                self.seen_row(ui, p);
+                                self.progress_row(ui, p, n, total);
                             });
                         });
                     });
@@ -1257,20 +1300,15 @@ fn study_card(
         .clicked()
 }
 
-/// Where we are in the view: a thin bar and `n / total`.
-fn progress_row(ui: &mut egui::Ui, p: &Palette, n: usize, total: usize) {
-    centered_row(ui, |ui| {
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(96.0, 4.0), egui::Sense::hover());
-        ui.painter().rect_filled(rect, 2, p.line);
-        let done = rect.width() * n as f32 / total.max(1) as f32;
-        let fill = egui::Rect::from_min_size(rect.min, egui::vec2(done, rect.height()));
-        ui.painter().rect_filled(fill, 2, p.accent);
-        ui.label(
-            egui::RichText::new(format!("{n} / {total}"))
-                .size(12.0)
-                .color(p.muted),
-        );
-    });
+/// Fraction of the deck seen: `seen / total` (0 for an empty deck).
+fn seen_fraction(seen: usize, total: usize) -> f32 {
+    seen as f32 / total.max(1) as f32
+}
+
+/// The study progress bar's fill: % seen, never the card's place
+/// in the shown (possibly shuffled) list.
+fn study_progress_fraction(session: &StudySession) -> f32 {
+    seen_fraction(session.seen_count(), session.total())
 }
 
 /// A segmented control; returns the newly picked value, if any.
@@ -1609,6 +1647,24 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn study_progress_bar_uses_seen_not_view_position() {
+        // Mirrors a resumed shuffle: the card on screen can sit far
+        // into the shown list while few cards have been seen. The
+        // bar must show % seen, not that position.
+        let (mut app, _temp) = test_app("progress-seen", &[]);
+        app.space(); // reveal a -> 1 of 3 seen
+        app.space(); // advance to b -> position 2 of 3, still 1 seen
+        assert_eq!(session(&app).view_position(), Some((2, 3)));
+        assert_eq!(session(&app).seen_count(), 1);
+        assert!(
+            (study_progress_fraction(session(&app)) - 1.0 / 3.0).abs() < f32::EPSILON,
+            "bar is seen/total, not view position 2/3"
+        );
+        assert_eq!(seen_fraction(0, 0), 0.0);
+        assert_eq!(seen_fraction(3, 3), 1.0);
     }
 
     #[test]
