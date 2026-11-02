@@ -11,6 +11,8 @@ see. Releasing moves those lines under the new version (see
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-11-02
+
 ### Added
 
 - A **Previous** control (`←` key) in the desktop app and the web
@@ -98,7 +100,8 @@ themselves 0.1.0 and were never released.
 The first, unreleased version: open an `.apkg`, `.csv`, `.tsv` or
 `.txt` deck, spacebar through it, and flag cards to study later.
 
-[Unreleased]: https://github.com/fhello23/runki/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/fhello23/runki/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/fhello23/runki/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/fhello23/runki/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/fhello23/runki/compare/v0.3.5...v0.4.0
 [0.3.5]: https://github.com/fhello23/runki/compare/v0.3.0...v0.3.5
