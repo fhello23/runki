@@ -284,6 +284,110 @@ fn order_filter_reshuffle_and_reset_use_shared_session_behavior() {
 }
 
 #[test]
+fn web_previous_works_immediately_after_server_restart_at_saved_position() {
+    let (_dir, library) = fixture();
+    let (mut server, _) = start(Some(library.clone()));
+    let first = post(&server, "/api/session/open", json!({"deck":"deck.tsv"}));
+    post(&server, "/api/session/space", json!({}));
+    let second = post(&server, "/api/session/space", json!({}));
+    post(&server, "/api/session/toggle-later", json!({}));
+    server.stop().unwrap();
+    let (server, _) = start(Some(library.clone()));
+    let resumed = post(&server, "/api/session/open", json!({"deck":"deck.tsv"}));
+    assert_eq!(resumed["current_id"], second["current_id"]);
+    assert_eq!(
+        resumed["can_previous"], true,
+        "no advance required after restart"
+    );
+    let previous = post(&server, "/api/session/previous", json!({}));
+    assert_eq!(previous["current_id"], first["current_id"]);
+    assert_eq!(previous["seen"], 1);
+    assert_eq!(previous["later"], 1);
+    let path = progress::state_path(&library.join("deck.tsv"), Some(&library));
+    let saved = progress::load(&library.join("deck.tsv"), &path).into_state();
+    assert_eq!(
+        saved.prefs.position.as_deref(),
+        first["current_id"].as_str()
+    );
+}
+
+#[test]
+fn web_previous_survives_page_reload_and_saves_position_without_losing_progress() {
+    let (_dir, library) = fixture();
+    let (server, _) = start(Some(library.clone()));
+    let first = post(&server, "/api/session/open", json!({"deck":"deck.tsv"}));
+    assert_eq!(first["can_previous"], false);
+    assert_eq!(
+        post(&server, "/api/session/previous", json!({}))["current_id"],
+        first["current_id"]
+    );
+    post(&server, "/api/session/space", json!({}));
+    let second = post(&server, "/api/session/space", json!({}));
+    post(&server, "/api/session/toggle-later", json!({}));
+    post(&server, "/api/session/space", json!({}));
+    // Safari reload fetches HTML and the existing server session, not a new deck.
+    assert!(request(&server, "GET", "/", None)
+        .body
+        .contains("id=\"previous\""));
+    assert_eq!(
+        request(&server, "GET", "/api/session", None).json()["can_previous"],
+        true
+    );
+    let previous = post(&server, "/api/session/previous", json!({}));
+    assert_eq!(previous["current_id"], first["current_id"]);
+    assert_eq!(previous["revealed"], false);
+    assert_eq!(previous["seen"], 2);
+    assert_eq!(previous["later"], 1);
+    let path = progress::state_path(&library.join("deck.tsv"), Some(&library));
+    let saved = progress::load(&library.join("deck.tsv"), &path).into_state();
+    assert_eq!(
+        saved.prefs.position.as_deref(),
+        first["current_id"].as_str()
+    );
+    assert!(saved.is_seen(first["current_id"].as_str().unwrap()));
+    assert!(saved.is_seen(second["current_id"].as_str().unwrap()));
+    assert!(saved.is_later(second["current_id"].as_str().unwrap()));
+    post(&server, "/api/session/space", json!({}));
+    assert_eq!(
+        post(&server, "/api/session/space", json!({}))["current_id"],
+        second["current_id"]
+    );
+    post(&server, "/api/session/close", json!({}));
+    assert_eq!(
+        post(&server, "/api/session/open", json!({"deck":"deck.tsv"}))["current_id"],
+        second["current_id"]
+    );
+}
+
+#[test]
+fn web_previous_returns_from_finished_unseen_and_next_retraces_seen_cards() {
+    let (_dir, library) = fixture();
+    let (server, _) = start(Some(library));
+    post(&server, "/api/session/open", json!({"deck":"deck.tsv"}));
+    post(&server, "/api/session/filter", json!({"filter":"unseen"}));
+    for _ in 0..2 {
+        post(&server, "/api/session/space", json!({}));
+        post(&server, "/api/session/space", json!({}));
+    }
+    let finished = request(&server, "GET", "/api/session", None).json();
+    assert_eq!(finished["empty"], true);
+    assert_eq!(finished["can_previous"], true);
+    assert_eq!(
+        post(&server, "/api/session/previous", json!({}))["front"],
+        "Second question"
+    );
+    assert_eq!(
+        post(&server, "/api/session/previous", json!({}))["front"],
+        "First question"
+    );
+    post(&server, "/api/session/space", json!({}));
+    let next = post(&server, "/api/session/space", json!({}));
+    assert_eq!(next["front"], "Second question");
+    assert_eq!(next["seen"], 2);
+    assert_eq!(next["filter"], "unseen");
+}
+
+#[test]
 fn missing_library_sessions_and_decks_have_clear_errors() {
     let (server, slot) = start(None);
     for (method, path, body, status) in [
@@ -302,6 +406,7 @@ fn missing_library_sessions_and_decks_have_clear_errors() {
     }
     for action in [
         "space",
+        "previous",
         "toggle-later",
         "order",
         "filter",

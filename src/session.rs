@@ -58,6 +58,11 @@ pub struct StudySession {
     /// Card id of the card on screen, if any.
     current: Option<String>,
     revealed: bool,
+    /// Cards actually left in this session, including cards now filtered out.
+    back_history: Vec<usize>,
+    /// Retrace backward navigation before continuing the filtered sequence.
+    /// `None` represents the finished/empty view.
+    forward_history: Vec<Option<usize>>,
     /// Cached card indices in the current order; rebuilt only when
     /// the order or seed changes, never per frame.
     order_cache: Vec<usize>,
@@ -97,6 +102,8 @@ impl StudySession {
             dirty: true,
             current: None,
             revealed: false,
+            back_history: Vec::new(),
+            forward_history: Vec::new(),
             order_cache,
             rank,
             by_id,
@@ -135,6 +142,50 @@ impl StudySession {
     /// Whether the answer is shown.
     pub fn revealed(&self) -> bool {
         self.revealed
+    }
+
+    /// Whether a previous card is available, including after resuming a deck.
+    pub fn can_previous(&self) -> bool {
+        !self.back_history.is_empty() || self.previous_index().is_some()
+    }
+
+    /// Return to the previous card, with its answer hidden. Seen marks and
+    /// study-later flags stay intact; the new position is saved as usual.
+    /// When no in-memory history remains, step back in the current card order.
+    pub fn previous(&mut self, now: i64) {
+        if let Some(previous) = self.back_history.pop().or_else(|| self.previous_index()) {
+            self.forward_history.push(self.current_index());
+            self.set_current_index(Some(previous), now);
+            self.revealed = false;
+        }
+    }
+
+    fn previous_index(&self) -> Option<usize> {
+        let before = match self.current_index() {
+            Some(index) => self.rank[index],
+            // Reopening a finished Unseen deck has no current card or history.
+            None if self.filter() == CardFilter::Unseen => self.order_cache.len(),
+            None => return None,
+        };
+        self.order_cache[..before]
+            .iter()
+            .rev()
+            .copied()
+            // Unseen must let users revisit seen cards without clearing marks.
+            .find(|&index| self.filter() != CardFilter::Later || self.passes(index))
+    }
+
+    fn clear_history(&mut self) {
+        self.back_history.clear();
+        self.forward_history.clear();
+    }
+
+    fn advance_to(&mut self, next: Option<usize>, now: i64) {
+        if let Some(current) = self.current_index().filter(|&index| Some(index) != next) {
+            self.back_history.push(current);
+        }
+        self.set_current_index(next, now);
+        self.revealed = false;
     }
 
     /// The current card order preference.
@@ -297,9 +348,11 @@ impl StudySession {
             return;
         };
         if self.revealed {
-            let next = self.next_passing_after(idx);
-            self.set_current_index(next, now);
-            self.revealed = false;
+            let next = self
+                .forward_history
+                .pop()
+                .unwrap_or_else(|| self.next_passing_after(idx));
+            self.advance_to(next, now);
         } else {
             let id = self.deck.cards[idx].id.clone();
             self.state.mark_seen(&id, now);
@@ -322,8 +375,8 @@ impl StudySession {
         self.dirty = true;
         if !on && self.state.prefs.filter == CardFilter::Later {
             let next = self.next_passing_after(idx);
-            self.set_current_index(next, now);
-            self.revealed = false;
+            self.forward_history.clear();
+            self.advance_to(next, now);
         }
     }
 
@@ -333,6 +386,7 @@ impl StudySession {
         if self.state.prefs.order == order {
             return;
         }
+        self.clear_history();
         self.state.prefs.order = order;
         self.state.prefs.t = now;
         self.dirty = true;
@@ -350,6 +404,7 @@ impl StudySession {
         if self.state.prefs.filter == filter {
             return;
         }
+        self.clear_history();
         self.state.prefs.filter = filter;
         self.state.prefs.t = now;
         self.dirty = true;
@@ -381,6 +436,7 @@ impl StudySession {
         if self.state.prefs.shuffle_seed == seed {
             return;
         }
+        self.clear_history();
         self.state.prefs.shuffle_seed = seed;
         self.state.prefs.t = now;
         self.dirty = true;
@@ -390,6 +446,7 @@ impl StudySession {
     /// Clear seen marks (study-later flags are kept). In the
     /// `Unseen` filter, jump to the first card in order.
     pub fn reset(&mut self, now: i64) {
+        self.clear_history();
         self.state.reset(now);
         self.dirty = true;
         if self.state.prefs.filter == CardFilter::Unseen {
@@ -492,6 +549,214 @@ mod tests {
             .iter()
             .map(|&i| s.deck().cards[i].id.clone())
             .collect()
+    }
+
+    #[test]
+    fn previous_is_available_immediately_after_resuming_saved_position() {
+        for filter in [CardFilter::All, CardFilter::Unseen, CardFilter::Later] {
+            let mut s = session(
+                &["a", "b", "c"],
+                state(
+                    &["a", "c"],
+                    &["a", "b"],
+                    CardOrder::Deck,
+                    filter,
+                    0,
+                    Some("c"),
+                ),
+            );
+            assert!(s.back_history.is_empty());
+            assert!(
+                s.can_previous(),
+                "saved position has a previous card in {filter:?}"
+            );
+            let seen = s.state().seen.clone();
+            let later = s.state().later.clone();
+            s.previous(2_000);
+            assert_eq!(
+                s.current_id(),
+                Some(if filter == CardFilter::Later {
+                    "a"
+                } else {
+                    "b"
+                })
+            );
+            assert_eq!(s.state().seen, seen);
+            assert_eq!(s.state().later, later);
+            s.space(3_000);
+            s.space(3_001);
+            assert_eq!(s.current_id(), Some("c"), "next returns to the saved card");
+        }
+    }
+
+    #[test]
+    fn previous_after_reopening_finished_or_shuffled_deck_uses_saved_order() {
+        let mut finished = session(
+            &["a", "b", "c"],
+            state(
+                &[],
+                &["a", "b", "c"],
+                CardOrder::Deck,
+                CardFilter::Unseen,
+                0,
+                None,
+            ),
+        );
+        assert!(finished.current_id().is_none());
+        assert!(finished.can_previous());
+        finished.previous(2_000);
+        assert_eq!(finished.current_id(), Some("c"));
+        assert_eq!(finished.seen_count(), 3);
+
+        let mut saved = state(&[], &[], CardOrder::Shuffled, CardFilter::All, 42, None);
+        let ordered = ordered_ids(&session(&["a", "b", "c"], saved.clone()));
+        saved.prefs.position = Some(ordered[2].clone());
+        let mut shuffled = session(&["a", "b", "c"], saved);
+        shuffled.previous(2_000);
+        assert_eq!(shuffled.current_id(), Some(ordered[1].as_str()));
+    }
+
+    #[test]
+    fn previous_retraces_actual_visits_in_deck_and_shuffled_order() {
+        for order in [CardOrder::Deck, CardOrder::Shuffled] {
+            let mut s = session(
+                &["a", "b", "c", "d"],
+                state(&["b"], &[], order, CardFilter::All, 42, None),
+            );
+            assert!(!s.can_previous());
+            s.previous(1_100);
+            let mut visited = Vec::new();
+            // Include wraparound, then go back more than one card.
+            for step in 0..6 {
+                visited.push(s.current_id().unwrap().to_string());
+                s.space(2_000 + step * 2);
+                s.space(2_001 + step * 2);
+            }
+            let marks = s.state().seen.clone();
+            let flags = s.state().later.clone();
+            for id in visited.iter().rev() {
+                s.previous(3_000);
+                assert_eq!(s.current_id(), Some(id.as_str()));
+                assert!(!s.revealed());
+                assert_eq!(s.state().prefs.position.as_deref(), Some(id.as_str()));
+                assert_eq!(s.state().seen, marks);
+                assert_eq!(s.state().later, flags);
+            }
+            assert!(!s.can_previous());
+        }
+    }
+
+    #[test]
+    fn previous_works_after_finishing_unseen_and_next_retraces_history() {
+        let mut s = session(
+            &["a", "b", "c"],
+            state(&[], &[], CardOrder::Deck, CardFilter::Unseen, 0, None),
+        );
+        for step in 0..3 {
+            s.space(2_000 + step * 2);
+            s.space(2_001 + step * 2);
+        }
+        assert!(s.current_id().is_none());
+        let marks = s.state().seen.clone();
+        s.previous(3_000);
+        assert_eq!(s.current_id(), Some("c"));
+        s.previous(3_001);
+        assert_eq!(s.current_id(), Some("b"));
+        s.previous(3_002);
+        assert_eq!(s.current_id(), Some("a"));
+        assert_eq!(s.state().seen, marks, "back never clears seen marks");
+        for expected in [Some("b"), Some("c"), None] {
+            s.space(4_000);
+            s.space(4_001);
+            assert_eq!(s.current_id(), expected);
+            assert_eq!(s.seen_count(), 3);
+        }
+    }
+
+    #[test]
+    fn previous_from_later_can_return_to_a_card_just_unflagged() {
+        let mut s = session(
+            &["a", "b", "c"],
+            state(
+                &["a", "c"],
+                &[],
+                CardOrder::Deck,
+                CardFilter::Later,
+                0,
+                None,
+            ),
+        );
+        s.toggle_later(2_000);
+        assert_eq!(s.current_id(), Some("c"));
+        s.previous(3_000);
+        assert_eq!(s.current_id(), Some("a"));
+        assert!(!s.is_later("a"));
+        assert_eq!(s.later_count(), 1);
+        s.space(4_000);
+        s.space(4_001);
+        assert_eq!(s.current_id(), Some("c"));
+    }
+
+    #[test]
+    fn navigation_history_starts_fresh_when_the_study_view_changes() {
+        for action in 0..4 {
+            let mut s = session(
+                &["a", "b", "c"],
+                state(&[], &[], CardOrder::Deck, CardFilter::All, 0, None),
+            );
+            for _ in 0..2 {
+                s.space(2_000);
+                s.space(2_001);
+            }
+            s.previous(3_000);
+            assert!(s.can_previous());
+            assert!(!s.forward_history.is_empty());
+            match action {
+                0 => s.set_order(CardOrder::Shuffled, 4_000),
+                1 => s.set_filter(CardFilter::Unseen, 4_000),
+                2 => s.reshuffle(4_000),
+                _ => s.reset(4_000),
+            }
+            assert!(s.back_history.is_empty());
+            assert!(s.forward_history.is_empty());
+        }
+        for ids in [&[][..], &["a"][..]] {
+            let mut s = session(ids, DeckState::new());
+            s.space(2_000);
+            s.space(2_001);
+            assert!(
+                !s.can_previous(),
+                "no previous card for an empty or single-card loop"
+            );
+        }
+    }
+
+    #[test]
+    fn saving_after_previous_keeps_progress_flags_and_resume_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("progress.json");
+        let mut s = StudySession::new(
+            deck(&["a", "b", "c"]),
+            state(&["a"], &[], CardOrder::Deck, CardFilter::All, 0, None),
+            path.clone(),
+            false,
+            OPEN,
+        );
+        s.space(2_000);
+        s.space(2_001);
+        s.space(2_002);
+        s.save().unwrap();
+        assert!(!s.dirty());
+        s.previous(3_000);
+        assert!(s.dirty());
+        s.save().unwrap();
+        let saved = progress::load(&s.deck().path, &path).into_state();
+        assert_eq!(saved.seen_count(["a", "b", "c"]), 2);
+        assert!(saved.is_later("a"));
+        assert_eq!(saved.prefs.position.as_deref(), Some("a"));
+        let reopened = StudySession::new(deck(&["a", "b", "c"]), saved, path, false, 4_000);
+        assert_eq!(reopened.current_id(), Some("a"));
+        assert_eq!(reopened.seen_count(), 2);
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //!   screen; **Library** in its top bar goes back.
 //! - `Space` (or a click on the card) shows the answer, then moves to
 //!   the next card (wrapping around at the end, so browsing never stops).
+//! - `Left` or **Previous** returns to the previously visited card.
 //! - `L` toggles the current card in the study-later list.
 //! - The study top bar picks the card order (deck order or shuffled)
 //!   and which cards to show (all, unseen only, or study-later only).
@@ -509,22 +510,32 @@ impl RunkiApp {
         }
     }
 
+    fn previous(&mut self) {
+        if let Some(session) = &mut self.session {
+            session.previous(progress::now_ms());
+        }
+    }
+
     fn study_shortcuts(&mut self, ctx: &egui::Context) {
         if self.screen == Screen::Study
             && !ctx.memory(|memory| memory.has_focus(web_port_field_id()))
         {
-            // Consume Space/L before widgets see them, so a focused
+            // Consume study keys before widgets see them, so a focused
             // button cannot also trigger on Space and double-advance.
             // While the reset confirmation is open they are consumed
             // but ignored.
             let space = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space));
+            let previous =
+                ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft));
             let later_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::L));
             let escape = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
             if escape {
                 self.show_reset_confirm = false;
             }
             if !self.show_reset_confirm {
-                if space {
+                if previous {
+                    self.previous();
+                } else if space {
                     self.space();
                 }
                 if later_key {
@@ -793,6 +804,10 @@ impl RunkiApp {
     }
 
     fn bottom_bar(&mut self, ctx: &egui::Context, p: &Palette) {
+        let can_previous = self
+            .session
+            .as_ref()
+            .is_some_and(StudySession::can_previous);
         let current = self.session.as_ref().and_then(|session| {
             let card = session.current_card()?;
             Some((session.is_later(&card.id), session.revealed()))
@@ -806,11 +821,22 @@ impl RunkiApp {
             }))
             .show_separator_line(false)
             .show(ctx, |ui| {
-                let Some((flagged, revealed)) = current else {
-                    ui.add_space(30.0);
-                    return;
-                };
                 centered_row(ui, |ui| {
+                    let previous = ui
+                        .add_enabled_ui(can_previous && !self.show_reset_confirm, |ui| {
+                            key_hint(ui, p, "Left", "Previous", p.muted)
+                        })
+                        .inner
+                        .on_hover_text(
+                            "Left arrow: return to the previous card; keeps your progress",
+                        );
+                    if previous.clicked() {
+                        self.previous();
+                        ctx.request_repaint();
+                    }
+                    let Some((flagged, revealed)) = current else {
+                        return;
+                    };
                     let label = if revealed { "Next" } else { "Show answer" };
                     if key_hint(ui, p, "Space", label, p.muted).clicked() {
                         self.space();
@@ -1362,18 +1388,6 @@ fn theme_toggle(ui: &mut egui::Ui, p: &Palette, current: egui::ThemePreference) 
         .clicked()
 }
 
-/// A key drawn as a small keycap.
-fn keycap(ui: &mut egui::Ui, p: &Palette, key: &str) {
-    egui::Frame::new()
-        .fill(p.surface)
-        .stroke(egui::Stroke::new(1.0_f32, p.line))
-        .corner_radius(5)
-        .inner_margin(egui::Margin::symmetric(6, 1))
-        .show(ui, |ui| {
-            ui.label(egui::RichText::new(key).size(11.0).color(p.muted));
-        });
-}
-
 /// A clickable "keycap + label" hint, for mouse users.
 fn key_hint(
     ui: &mut egui::Ui,
@@ -1382,24 +1396,48 @@ fn key_hint(
     label: &str,
     color: egui::Color32,
 ) -> egui::Response {
-    let background = ui.painter().add(egui::Shape::Noop);
-    let response = ui
-        .scope_builder(egui::UiBuilder::new().sense(egui::Sense::click()), |ui| {
-            egui::Frame::new()
-                .inner_margin(egui::Margin::symmetric(10, 6))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        keycap(ui, p, key);
-                        ui.label(egui::RichText::new(label).color(color));
-                    });
-                });
-        })
-        .response;
-    if response.hovered() {
-        ui.painter().set(
-            background,
-            egui::epaint::RectShape::filled(response.rect, 8, p.hover),
+    let key_text =
+        ui.painter()
+            .layout_no_wrap(key.to_owned(), egui::FontId::proportional(11.0), p.muted);
+    let label_text = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        egui::TextStyle::Body.resolve(ui.style()),
+        color,
+    );
+    let key_size = key_text.size() + egui::vec2(12.0, 2.0);
+    let gap = ui.spacing().item_spacing.x;
+    let size = egui::vec2(
+        key_size.x + gap + label_text.size().x + 20.0,
+        key_size.y.max(label_text.size().y) + 12.0,
+    );
+    // One hit target for the whole hint: nested selectable labels must not
+    // intercept taps on the keycap or label.
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+    });
+    if ui.is_rect_visible(rect) {
+        if response.hovered() || response.has_focus() {
+            ui.painter().rect_filled(rect, 8, p.hover);
+        }
+        let key_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.left() + 10.0, rect.center().y - key_size.y / 2.0),
+            key_size,
         );
+        ui.painter().rect_filled(key_rect, 5, p.surface);
+        ui.painter().rect_stroke(
+            key_rect,
+            5,
+            egui::Stroke::new(1.0_f32, p.line),
+            egui::StrokeKind::Inside,
+        );
+        ui.painter()
+            .galley(key_rect.min + egui::vec2(6.0, 1.0), key_text, p.muted);
+        let label_pos = egui::pos2(
+            key_rect.right() + gap,
+            rect.center().y - label_text.size().y / 2.0,
+        );
+        ui.painter().galley(label_pos, label_text, color);
     }
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
@@ -1537,6 +1575,140 @@ mod tests {
 
     fn session(app: &RunkiApp) -> &StudySession {
         app.session.as_ref().expect("session")
+    }
+
+    #[test]
+    fn previous_shortcut_preserves_progress_and_waits_for_reset_dialog() {
+        let (mut app, _temp) = test_app("previous-shortcut", &["a"]);
+        app.space();
+        app.space();
+        app.space();
+        app.space();
+        assert_eq!(session(&app).current_id(), Some("c"));
+        let ctx = egui::Context::default();
+        for (modal, expected) in [(true, "c"), (false, "b")] {
+            app.show_reset_confirm = modal;
+            let _ = ctx.run(
+                egui::RawInput {
+                    events: vec![egui::Event::Key {
+                        key: egui::Key::ArrowLeft,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                |ctx| {
+                    app.study_shortcuts(ctx);
+                    assert_eq!(session(&app).current_id(), Some(expected));
+                    assert!(!ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)));
+                },
+            );
+        }
+        assert!(!session(&app).revealed());
+        assert_eq!(session(&app).seen_count(), 2);
+        assert!(session(&app).is_later("a"));
+        app.save_now();
+        let s = session(&app);
+        let saved = progress::load(&s.deck().path, s.state_path()).into_state();
+        assert_eq!(saved.prefs.position.as_deref(), Some("b"));
+        assert!(saved.is_seen("a") && saved.is_seen("b"));
+        assert!(saved.is_later("a"));
+    }
+
+    #[test]
+    fn previous_button_works_on_resumed_card_without_any_new_advance() {
+        let (mut app, _temp) = test_app("previous-resumed", &["a"]);
+        let old = app.session.take().unwrap();
+        let mut saved = old.state().clone();
+        saved.prefs.position = Some("b".into());
+        saved.mark_seen("a", 2_000);
+        app.session = Some(StudySession::new(
+            old.deck().clone(),
+            saved,
+            old.state_path().clone(),
+            false,
+            3_000,
+        ));
+        click_study_control(&mut app, &egui::Context::default(), "Previous");
+        assert_eq!(session(&app).current_id(), Some("a"));
+        assert_eq!(session(&app).seen_count(), 1);
+        assert_eq!(session(&app).later_count(), 1);
+    }
+
+    #[test]
+    fn previous_button_returns_from_the_finished_unseen_screen() {
+        let (mut app, _temp) = test_app("previous-button", &[]);
+        app.session
+            .as_mut()
+            .unwrap()
+            .set_filter(CardFilter::Unseen, 2_000);
+        for _ in 0..3 {
+            app.space();
+            app.space();
+        }
+        assert!(session(&app).current_id().is_none());
+        click_study_control(&mut app, &egui::Context::default(), "Previous");
+        assert_eq!(session(&app).current_id(), Some("c"));
+        assert_eq!(session(&app).seen_count(), 3);
+        assert!(!session(&app).revealed());
+    }
+
+    #[test]
+    fn study_control_keycaps_and_labels_respond_to_mouse_clicks() {
+        let (mut app, _temp) = test_app("click-study-controls", &[]);
+        let ctx = egui::Context::default();
+        click_study_control(&mut app, &ctx, "Show answer");
+        assert!(session(&app).revealed());
+        click_study_control(&mut app, &ctx, "Next");
+        assert_eq!(session(&app).current_id(), Some("b"));
+        click_study_control(&mut app, &ctx, "Study later");
+        assert!(session(&app).is_later("b"));
+        click_study_control(&mut app, &ctx, "Previous");
+        assert_eq!(session(&app).current_id(), Some("a"));
+        assert_eq!(session(&app).seen_count(), 1);
+        click_study_control(&mut app, &ctx, "Previous");
+        assert_eq!(session(&app).current_id(), Some("a"), "disabled at start");
+    }
+
+    fn click_study_control(app: &mut RunkiApp, ctx: &egui::Context, label: &str) {
+        let mut draw = |events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 650.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.bottom_bar(ctx, &Palette::of(ctx)),
+            )
+        };
+        let output = draw(vec![]);
+        let pos = output
+            .shapes
+            .iter()
+            .find_map(|shape| {
+                if let egui::Shape::Text(text) = &shape.shape {
+                    (text.galley.text() == label).then(|| text.pos + text.galley.size() / 2.0)
+                } else {
+                    None
+                }
+            })
+            .expect("study control is visible");
+        for pressed in [true, false] {
+            draw(vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+        }
     }
 
     #[derive(Default)]

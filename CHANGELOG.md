@@ -11,6 +11,13 @@ see. Releasing moves those lines under the new version (see
 
 ## [Unreleased]
 
+### Added
+
+- A **Previous** control (`←` key) in the desktop app and the web
+  interface returns to the previously visited card with its answer
+  hidden, keeping seen marks and study-later flags. It also works right
+  after reopening a saved deck and after finishing `Unseen`.
+
 ## [0.4.1] - 2026-11-01
 
 ### Fixed

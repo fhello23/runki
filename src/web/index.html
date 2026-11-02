@@ -28,13 +28,13 @@
 <button id="card" class="card" aria-label="Reveal answer or advance to next card"><span id="front" class="front"></span><span id="back" class="back" hidden></span></button>
 <p id="empty" role="status" hidden></p>
 <div class="controls">
-<div class="row"><button id="space" class="primary">Reveal</button><button id="later" aria-pressed="false">Later</button></div>
+<div class="row"><button id="previous" aria-label="Go back to the previous card" disabled>Previous</button><button id="space" class="primary">Reveal</button><button id="later" aria-pressed="false">Later</button></div>
 <div class="row"><label>Order<select id="order"><option value="deck">Deck order</option><option value="shuffled">Shuffled</option></select></label><button id="reshuffle">Reshuffle</button></div>
 <label>Show<select id="filter"><option value="all">All</option><option value="unseen">Unseen</option><option value="later">Later</option></select></label>
 </div>
 <p id="counts"></p>
 <button id="reset">Reset progress…</button>
-<p class="muted">Keys: Space reveal/next · L later · 1 / 2 / 3 filter</p>
+<p class="muted">Keys: ← previous · Space reveal/next · L later · 1 / 2 / 3 filter</p>
 </section>
 <noscript>Enable JavaScript to study with Runki.</noscript>
 </main>
@@ -76,6 +76,7 @@ function render(view) {
   $('counts').textContent = view.seen + ' / ' + view.total + ' seen · ' + view.later + ' later';
   $('space').textContent = view.revealed ? 'Next' : 'Reveal';
   $('space').disabled = view.empty;
+  $('previous').disabled = !view.can_previous;
   $('later').disabled = view.empty;
   $('later').classList.toggle('active', view.is_later);
   $('later').setAttribute('aria-pressed', String(view.is_later));
@@ -120,6 +121,7 @@ async function library() {
 const mutate = (path, body = {}) => action(async () => render(await api('session/' + path, body)));
 $('refresh').onclick = () => action(library);
 $('card').onclick = $('space').onclick = () => { if (session && !session.empty) mutate('space'); };
+$('previous').onclick = () => { if (session && session.can_previous) mutate('previous'); };
 $('later').onclick = () => mutate('toggle-later');
 $('order').onchange = () => mutate('order', {order:$('order').value});
 $('filter').onchange = () => mutate('filter', {filter:$('filter').value});
@@ -129,9 +131,10 @@ $('close').onclick = () => action(async () => { await api('session/close', {}); 
 document.addEventListener('keydown', event => {
   if (!session || busy || event.repeat || event.ctrlKey || event.altKey || event.metaKey || ['INPUT','SELECT','TEXTAREA'].includes(event.target.tagName)) return;
   const key = event.key.toLowerCase();
-  if (key === ' ' || key === 'l' || ['1','2','3'].includes(key)) {
+  if (key === 'arrowleft' || key === ' ' || key === 'l' || ['1','2','3'].includes(key)) {
     event.preventDefault();
-    if (key === ' ') { if (!session.empty) mutate('space'); }
+    if (key === 'arrowleft') { if (session.can_previous) mutate('previous'); }
+    else if (key === ' ') { if (!session.empty) mutate('space'); }
     else if (key === 'l') { if (!session.empty) mutate('toggle-later'); }
     else mutate('filter', {filter:{'1':'all','2':'unseen','3':'later'}[key]});
   }

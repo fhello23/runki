@@ -188,6 +188,7 @@ fn route(
         "/" | "/api/status" | "/api/library" | "/api/session" => "GET",
         "/api/session/open"
         | "/api/session/space"
+        | "/api/session/previous"
         | "/api/session/toggle-later"
         | "/api/session/order"
         | "/api/session/filter"
@@ -285,6 +286,7 @@ fn route(
             let now = progress::now_ms();
             match request.path.as_str() {
                 "/api/session/space" => session.space(now),
+                "/api/session/previous" => session.previous(now),
                 "/api/session/toggle-later" => session.toggle_later(now),
                 "/api/session/reshuffle" => session.reshuffle(now),
                 "/api/session/reset" => session.reset(now),
@@ -387,6 +389,7 @@ fn session_view(session: &StudySession) -> Value {
         "deck_name": session.deck().name,
         "file_name": session.deck().path.file_name().unwrap_or_default().to_string_lossy(),
         "revealed": session.revealed(),
+        "can_previous": session.can_previous(),
         "front": card.map(|card| card.front.as_str()),
         "back": card.filter(|_| session.revealed()).map(|card| card.back.as_str()),
         "current_id": session.current_id(),

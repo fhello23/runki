@@ -182,6 +182,13 @@ an error without changing the remembered port. If restoring the old listener
 also fails, Web turns off. Starting Web on a busy port likewise leaves it
 off with an error.
 
+The browser (including Safari on iOS) has a **Previous** button beside
+**Reveal/Next** to return to cards visited in the current web session,
+including after reopening a saved deck, in Unseen, and after finishing
+the deck. Seen marks and study-later flags are preserved. Reloading the
+page keeps this history while the server session remains open. After
+updating Runki, reload Safari to load the new button.
+
 The browser can browse the library, reveal and advance cards, toggle study
 later, change order and filters, reshuffle, and reset seen progress. Decks
 must be downloaded and inside the chosen library; a deck opened separately
@@ -237,12 +244,19 @@ You can also drag a deck file onto the study window to open it.
 | Key / button | Action |
 | --- | --- |
 | `Space` or click the card | Show the answer; press again for the next card (wraps around at the end) |
+| `←` or **Previous** | Return to the previous card, including after resuming a saved deck, with its answer hidden; keeps seen progress and study-later flags |
 | `L` | Toggle the current card in the study-later list |
 | **Library** | Save and go back to the library screen |
 | **Theme icon** (top right) | Cycle match system → light → dark; remembered between launches |
 | **Order:** `Deck order` / `Shuffled` | Show cards as they are in the deck, or in a shuffled order |
 | **Reshuffle** (shuffled only) | Pick a new shuffle; the card on screen stays |
 | **Show:** `All` / `Unseen` / `Later (n)` | Show every card, only cards you have not seen yet, or only flagged cards |
+
+**Previous** also works in `Unseen`, `Later`, and after finishing the
+last unseen card. Moving forward retraces the cards you went back over.
+Without session history, **Previous** uses the previous card in the current
+deck/shuffled order. In Unseen it can revisit seen cards; in Later it steps
+back through flagged cards. Progress still saves automatically.
 
 Revealing a card's answer marks it seen. In `Unseen`, the card stays
 on screen until you move on. When every card has been seen, `Unseen`
